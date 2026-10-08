@@ -19,6 +19,18 @@
 //! and counted, never fragmented. If that happens, lower the packet size on
 //! the sending application (for SRT: `pkt_size` / `payloadsize` /
 //! `SRTO_PAYLOADSIZE`).
+//!
+//! # Logging
+//!
+//! The amount of detail is driven by the `-v` count of the calling subcommand,
+//! which is passed to [`bridge`] as the `stats` flag and reflected in the log
+//! levels used here:
+//!
+//! * info: tunnel established, max datagram size, and the full counters when the
+//!   tunnel closes.
+//! * debug: periodic counters while the tunnel runs, plus every local socket
+//!   bind and every non-fatal failure.
+//! * trace: one line per datagram, in both directions, with size and address.
 
 use std::{
     io,
@@ -27,6 +39,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -45,6 +58,9 @@ pub const ALPN: &[u8] = b"DUMBPIPE_UDP_V0";
 /// This is the largest possible UDP payload, so no packet can ever be
 /// truncated.
 const UDP_BUF: usize = 65535;
+
+/// How often periodic counters are logged while a tunnel is running.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Whether errors when sending to or receiving from a local UDP socket should
 /// be treated as transient.
@@ -91,9 +107,16 @@ pub async fn bind_for(target: SocketAddr) -> Result<UdpSocket> {
         (false, true) => "0.0.0.0:0",
         (false, false) => "[::]:0",
     };
-    UdpSocket::bind(bind)
+    let socket = UdpSocket::bind(bind)
         .await
-        .std_context(format!("error binding udp socket to {bind}"))
+        .std_context(format!("error binding udp socket to {bind}"))?;
+    tracing::debug!(
+        "bound local udp socket {} for target {target}",
+        socket
+            .local_addr()
+            .map_or_else(|e| format!("unknown ({e})"), |addr| addr.to_string(),)
+    );
+    Ok(socket)
 }
 
 /// Counters for a running udp bridge, used for logging.
@@ -109,9 +132,54 @@ struct Counters {
     recv_bytes: AtomicU64,
     /// Packets dropped because they were too large for a QUIC datagram.
     dropped: AtomicU64,
+    /// Datagrams that could not be delivered because the destination was not
+    /// known yet.
+    no_peer: AtomicU64,
+    /// Datagrams that could not be delivered to the local UDP socket.
+    local_failed: AtomicU64,
 }
 
 impl Counters {
+    fn get(&self, counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    /// Log a periodic stats line, at debug level.
+    ///
+    /// Only called when the caller asked for stats, i.e. `-vv` or higher.
+    fn log_periodic(&self, target: Option<SocketAddr>) {
+        tracing::debug!(
+            "udp tunnel stats ({}): {} packets / {} bytes sent, {} packets / {} bytes received, \
+             {} oversized dropped, {} undeliverable ({} no peer, {} local failure)",
+            target.map_or("connect side".to_string(), |target| format!("to {target}")),
+            self.get(&self.sent),
+            self.get(&self.sent_bytes),
+            self.get(&self.recv),
+            self.get(&self.recv_bytes),
+            self.get(&self.dropped),
+            self.get(&self.no_peer) + self.get(&self.local_failed),
+            self.get(&self.no_peer),
+            self.get(&self.local_failed),
+        );
+    }
+
+    /// Log the final stats line when the tunnel closes, at info level.
+    fn log_final(&self) {
+        tracing::info!(
+            "udp tunnel closed: {} packets / {} bytes sent, {} packets / {} bytes received, \
+             {} oversized dropped, {} undeliverable ({} no peer, {} local failure)",
+            self.get(&self.sent),
+            self.get(&self.sent_bytes),
+            self.get(&self.recv),
+            self.get(&self.recv_bytes),
+            self.get(&self.dropped),
+            self.get(&self.no_peer) + self.get(&self.local_failed),
+            self.get(&self.no_peer),
+            self.get(&self.local_failed),
+        );
+    }
+
+    /// Record an oversized packet that had to be dropped.
     fn record_dropped(&self, size: usize, max: usize) {
         let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         // log the first one and then every 1000th, so a misconfigured sender
@@ -131,6 +199,8 @@ impl Counters {
 ///   (the `listen-udp` side).
 /// * `target = None`: incoming datagrams are sent to whichever local address
 ///   last sent us a packet (the `connect-udp` side).
+/// * `stats`: log periodic counters while running, and one line per datagram
+///   if the log level allows it.
 ///
 /// Returns when either side fails, when the connection is closed, or when the
 /// returned future is dropped.
@@ -138,6 +208,7 @@ pub async fn bridge(
     conn: Connection,
     sock: Arc<UdpSocket>,
     target: Option<SocketAddr>,
+    stats: bool,
 ) -> Result<()> {
     // The peer must have announced datagram support during the handshake.
     match conn.max_datagram_size() {
@@ -150,21 +221,41 @@ pub async fn bridge(
     let learn = target.is_none();
     let peer = Arc::new(Mutex::new(target));
 
+    let local_addr = sock
+        .local_addr()
+        .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
+    tracing::debug!("udp bridge running, local socket {local_addr}");
+
+    // Periodically report what the tunnel is doing, or never fire if the user
+    // did not ask for stats.
+    let counters2 = counters.clone();
+    let stats_loop = async move {
+        if !stats {
+            std::future::pending::<()>().await;
+        }
+        loop {
+            tokio::time::sleep(STATS_INTERVAL).await;
+            counters2.log_periodic(target);
+        }
+    };
+
     let result = tokio::select! {
         res = udp_to_quic(&conn, &sock, &peer, learn, &counters) => res,
         res = quic_to_udp(&conn, &sock, &peer, &counters) => res,
+        _ = stats_loop => unreachable_err(),
         _ = conn.closed() => Ok(()),
     };
 
-    tracing::info!(
-        "udp bridge closed: {} packets / {} bytes sent, {} packets / {} bytes received, {} oversized packets dropped",
-        counters.sent.load(Ordering::Relaxed),
-        counters.sent_bytes.load(Ordering::Relaxed),
-        counters.recv.load(Ordering::Relaxed),
-        counters.recv_bytes.load(Ordering::Relaxed),
-        counters.dropped.load(Ordering::Relaxed),
-    );
+    counters.log_final();
     result
+}
+
+/// Unreachable: the stats loop never returns `Ok`.
+///
+/// Exists so the `select!` in [`bridge`] can have a stats arm that is
+/// conditionally disabled without changing the arm types.
+fn unreachable_err() -> Result<()> {
+    bail_any!("stats loop terminated unexpectedly")
 }
 
 /// Forward packets from the local UDP socket to the connection as datagrams.
@@ -179,12 +270,19 @@ async fn udp_to_quic(
     loop {
         let (len, src) = match sock.recv_from(&mut buf).await {
             Ok((len, src)) => (len, src),
-            Err(e) if is_transient(&e) => continue,
+            Err(e) if is_transient(&e) => {
+                tracing::debug!("transient error receiving from udp socket: {e}");
+                continue;
+            }
             Err(e) => return Err(e).std_context("error receiving from udp socket"),
         };
 
         if learn {
-            *peer.lock().unwrap() = Some(src);
+            let mut peer = peer.lock().unwrap();
+            if *peer != Some(src) {
+                tracing::debug!("learned new local peer {src}");
+                *peer = Some(src);
+            }
         }
 
         // The limit can shrink over time as the path mtu estimate changes, so
@@ -199,6 +297,7 @@ async fn udp_to_quic(
             Ok(()) => {
                 counters.sent.fetch_add(1, Ordering::Relaxed);
                 counters.sent_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                tracing::trace!("udp {src} -> quic datagram ({len} bytes)");
             }
             // The path mtu estimate shrank between the check above and the
             // send. Behave like UDP and drop.
@@ -228,7 +327,8 @@ async fn quic_to_udp(
 
         // On the connect side there may not be anybody to deliver to yet.
         let Some(dst) = *peer.lock().unwrap() else {
-            tracing::trace!("dropping datagram, no known peer");
+            counters.no_peer.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!("dropped datagram ({} bytes), no local peer yet", data.len());
             continue;
         };
 
@@ -238,10 +338,17 @@ async fn quic_to_udp(
                 counters
                     .recv_bytes
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
+                tracing::trace!("quic datagram ({} bytes) -> udp {dst}", data.len());
             }
             // The local application is not listening (anymore). Normal for UDP.
-            Err(e) if is_transient(&e) => tracing::trace!("could not send to {dst}: {e}"),
-            Err(e) => tracing::debug!("error sending udp packet to {dst}: {e}"),
+            Err(e) if is_transient(&e) => {
+                counters.local_failed.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("could not deliver datagram to {dst}: {e}");
+            }
+            Err(e) => {
+                counters.local_failed.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("error sending udp packet to {dst}: {e}");
+            }
         }
     }
 }

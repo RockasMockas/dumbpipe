@@ -17,12 +17,14 @@ use iroh::{
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UdpSocket,
     select,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Level;
+use tracing_subscriber::EnvFilter;
 #[cfg(unix)]
 use {
     std::path::PathBuf,
@@ -30,6 +32,15 @@ use {
 };
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The highest verbosity level supported by `--verbose` / `--verbose-max`.
+const MAX_VERBOSE: u8 = 3;
+
+/// The verbosity used by subcommands that have no common args.
+const DEFAULT_VERBOSITY: u8 = 0;
+
+/// The size of the buffer used when copying between local io and noq streams.
+const COPY_BUF: usize = 8 * 1024;
 
 /// Create a dumb pipe between two machines, using an iroh endpoint.
 ///
@@ -134,6 +145,29 @@ pub enum Commands {
     ConnectUnix(ConnectUnixArgs),
 }
 
+impl Commands {
+    /// The common args of a subcommand, if it has any.
+    ///
+    /// Used to configure logging before the subcommand itself runs.
+    fn common(&self) -> Option<&CommonArgs> {
+        match self {
+            Commands::GenerateTicket => None,
+            Commands::Listen(args) => Some(&args.common),
+            Commands::ListenTcp(args) => Some(&args.common),
+            Commands::Connect(args) => Some(&args.common),
+            Commands::ConnectTcp(args) => Some(&args.common),
+            Commands::ListenUdp(args) => Some(&args.common),
+            Commands::ConnectUdp(args) => Some(&args.common),
+
+            #[cfg(unix)]
+            Commands::ListenUnix(args) => Some(&args.common),
+
+            #[cfg(unix)]
+            Commands::ConnectUnix(args) => Some(&args.common),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct CommonArgs {
     /// The IPv4 address that the endpoint will listen on.
@@ -165,8 +199,38 @@ pub struct CommonArgs {
     pub custom_alpn: Option<String>,
 
     /// The verbosity level. Repeat to increase verbosity.
+    ///
+    /// Each level includes everything from the levels below it.
+    ///
+    /// 0 (default): errors only.
+    ///
+    /// 1 (`-v`): info. Connection lifecycle: endpoint creation, dialing and
+    /// accepting, handshakes, local socket binds, and byte/packet totals when a
+    /// tunnel closes.
+    ///
+    /// 2 (`-vv`): debug. Everything above, plus every stream and datagram event,
+    /// the negotiated ALPN and max datagram size, non-fatal errors, and a stats
+    /// line every few seconds while a tunnel is running.
+    ///
+    /// 3 (`-vvv`): trace. Everything above, plus one line per copied chunk and
+    /// per datagram with sizes and addresses, and iroh's own internal logging.
+    ///
+    /// Capped by `--verbose-max`. Overridden by `RUST_LOG`, which wins if set.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// The highest verbosity level that `--verbose` can reach.
+    ///
+    /// The effective verbosity is `min(verbose, verbose_max)`, so
+    /// `-v -v -v --verbose-max 1` logs at info level only. This is useful when
+    /// verbosity is set globally (e.g. in a wrapper script or `alias`) but the
+    /// full detail would be too noisy or too slow.
+    ///
+    /// Defaults to 3 (trace), the highest supported level. Values above that are
+    /// clamped. Ignored when `RUST_LOG` is set, since `RUST_LOG` overrides the
+    /// verbosity entirely.
+    #[clap(long, default_value_t = MAX_VERBOSE)]
+    pub verbose_max: u8,
 }
 
 impl CommonArgs {
@@ -180,6 +244,57 @@ impl CommonArgs {
     fn is_custom_alpn(&self) -> bool {
         self.custom_alpn.is_some()
     }
+
+    /// The effective verbosity: the `-v` count, clamped to `--verbose-max`.
+    ///
+    /// Always in the range `0..=MAX_VERBOSE`.
+    fn verbosity(&self) -> u8 {
+        self.verbose.min(self.verbose_max).min(MAX_VERBOSE)
+    }
+}
+
+/// Set up logging based on the verbosity flags.
+///
+/// `RUST_LOG` takes precedence if it is set, otherwise the default filter is
+/// derived from the clamped `-v` count.
+///
+/// Takes the common args as an `Option` because not every subcommand has any
+/// (e.g. `generate-ticket`).
+fn init_logging(common: Option<&CommonArgs>) {
+    let verbosity = common.map(|c| c.verbosity()).unwrap_or(DEFAULT_VERBOSITY);
+    let filter = EnvFilter::builder()
+        .with_default_directive(log_level(verbosity).into())
+        .from_env_lossy();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    if let Some(common) = common {
+        // tell the user what they are getting, and why it might be less than
+        // they asked for, but only when they asked for something
+        if common.verbose > 0 {
+            eprintln!("logging at {} level", log_level(verbosity));
+            if verbosity < common.verbose {
+                eprintln!(
+                    "note: verbosity clamped from {} to {} by --verbose-max {}",
+                    common.verbose, verbosity, common.verbose_max
+                );
+            }
+        }
+    }
+}
+
+/// The log level for a verbosity level.
+fn log_level(verbosity: u8) -> Level {
+    match verbosity {
+        0 => Level::ERROR,
+        1 => Level::INFO,
+        2 => Level::DEBUG,
+        _ => Level::TRACE,
+    }
+}
+
+/// Whether per-tunnel periodic stats should be logged while running.
+fn stats_enabled(verbosity: u8) -> bool {
+    verbosity >= 2
 }
 
 fn parse_alpn(alpn: &str) -> Result<Vec<u8>> {
@@ -304,6 +419,40 @@ pub struct ConnectUnixArgs {
     pub common: CommonArgs,
 }
 
+/// Copy from a reader to a writer, logging every chunk and the total.
+///
+/// This is what makes `-vvv` noisy: one trace line per chunk. The totals are
+/// logged at debug level, so they are visible from `-vv` upwards.
+///
+/// Returns the number of bytes copied.
+async fn copy_verbose(
+    from: &mut (impl AsyncRead + Unpin),
+    to: &mut (impl AsyncWrite + Unpin),
+    direction: &'static str,
+) -> io::Result<u64> {
+    let mut buf = vec![0u8; COPY_BUF];
+    let mut total: u64 = 0;
+    let mut chunks: u64 = 0;
+    loop {
+        let len = from.read(&mut buf).await?;
+        if len == 0 {
+            break;
+        }
+        to.write_all(&buf[..len]).await?;
+        total += len as u64;
+        chunks += 1;
+        tracing::trace!(
+            direction,
+            chunk = chunks,
+            bytes = len,
+            total,
+            "copied chunk"
+        );
+    }
+    tracing::debug!(direction, chunks, total, "copy finished");
+    Ok(total)
+}
+
 /// Copy from a reader to a noq stream.
 ///
 /// Will send a reset to the other side if the operation is cancelled, and fail
@@ -315,14 +464,15 @@ async fn copy_to_noq(
     mut send: noq::SendStream,
     token: CancellationToken,
 ) -> io::Result<u64> {
-    tracing::trace!("copying to noq");
+    tracing::debug!("copying local io to quic stream");
     tokio::select! {
-        res = tokio::io::copy(&mut from, &mut send) => {
+        res = copy_verbose(&mut from, &mut send, "local -> quic") => {
             let size = res?;
             send.finish()?;
             Ok(size)
         }
         _ = token.cancelled() => {
+            tracing::debug!("copy to quic stream cancelled, resetting stream");
             // send a reset to the other side immediately
             send.reset(0u8.into()).ok();
             Err(io::Error::other("cancelled"))
@@ -341,15 +491,33 @@ async fn copy_from_noq(
     mut to: impl AsyncWrite + Unpin,
     token: CancellationToken,
 ) -> io::Result<u64> {
+    tracing::debug!("copying quic stream to local io");
     tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
+        res = copy_verbose(&mut recv, &mut to, "quic -> local") => {
             Ok(res?)
         },
         _ = token.cancelled() => {
+            tracing::debug!("copy from quic stream cancelled, stopping stream");
             recv.stop(0u8.into()).ok();
             Err(io::Error::other("cancelled"))
         }
     }
+}
+
+/// Read and verify the handshake from a noq stream.
+async fn read_handshake(recv: &mut noq::RecvStream) -> Result<()> {
+    let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
+    recv.read_exact(&mut buf).await.anyerr()?;
+    ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+    tracing::debug!("handshake verified");
+    Ok(())
+}
+
+/// Write the handshake to a noq stream.
+async fn write_handshake(send: &mut noq::SendStream) -> Result<()> {
+    send.write_all(&dumbpipe::HANDSHAKE).await.anyerr()?;
+    tracing::debug!("handshake sent");
+    Ok(())
 }
 
 /// Get the secret key or generate a new one.
@@ -375,16 +543,29 @@ async fn create_endpoint(
     common: &CommonArgs,
     alpns: Vec<Vec<u8>>,
 ) -> Result<Endpoint> {
+    for alpn in &alpns {
+        tracing::debug!(
+            "endpoint alpn: {} (hex {})",
+            String::from_utf8_lossy(alpn),
+            hex::encode(alpn)
+        );
+    }
+    if alpns.is_empty() {
+        tracing::debug!("endpoint has no alpns (connect-only)");
+    }
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(alpns);
     if let Some(addr) = common.ipv4_addr {
+        tracing::debug!("binding ipv4 addr {addr}");
         builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = common.ipv6_addr {
+        tracing::debug!("binding ipv6 addr {addr}");
         builder = builder.bind_addr(addr)?;
     }
     let endpoint = builder.bind().await.anyerr()?;
+    tracing::debug!("endpoint bound: {:?}", endpoint.addr());
     Ok(endpoint)
 }
 
@@ -422,8 +603,11 @@ async fn forward_bidi(
         token3.cancel();
         io::Result::Ok(())
     });
-    forward_to_stdout.await.anyerr()?.anyerr()?;
-    forward_from_stdin.await.anyerr()?.anyerr()?;
+    let to_local = forward_to_stdout.await.anyerr()?.anyerr()?;
+    let to_remote = forward_from_stdin.await.anyerr()?.anyerr()?;
+    tracing::info!(
+        "stream closed: {to_local} bytes quic -> local, {to_remote} bytes local -> quic"
+    );
     Ok(())
 }
 
@@ -445,6 +629,7 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
     if args.common.verbose > 0 {
         eprintln!("or:\ndumbpipe connect {short}");
     }
+    tracing::info!("waiting for connections");
 
     loop {
         let Some(connecting) = endpoint.accept().await else {
@@ -471,9 +656,7 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
         tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
         if !args.common.is_custom_alpn() {
             // read the handshake and verify it
-            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+            read_handshake(&mut r).await?;
         }
         if args.recv_only {
             tracing::info!(
@@ -497,6 +680,7 @@ async fn connect_stdio(args: ConnectArgs) -> Result<()> {
     let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
     let addr = args.ticket.endpoint_addr();
     let remote_endpoint_id = addr.id;
+    tracing::info!("connecting to {}", remote_endpoint_id);
     // connect to the remote, try only once
     let connection = endpoint
         .connect(addr.clone(), &args.common.alpn()?)
@@ -511,7 +695,7 @@ async fn connect_stdio(args: ConnectArgs) -> Result<()> {
     if !args.common.is_custom_alpn() {
         // the connecting side must write first. we don't know if there will be something
         // on stdin, so just write a handshake.
-        s.write_all(&dumbpipe::HANDSHAKE).await.anyerr()?;
+        write_handshake(&mut s).await?;
     }
     if args.recv_only {
         tracing::info!(
@@ -563,10 +747,16 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         let (tcp_recv, tcp_send) = tcp_stream.into_split();
         tracing::info!("got tcp connection from {}", tcp_addr);
         let remote_endpoint_id = addr.id;
+        tracing::debug!(
+            "dialing {remote_endpoint_id} with alpn {} (hex {})",
+            String::from_utf8_lossy(alpn),
+            hex::encode(alpn)
+        );
         let connection = endpoint
             .connect(addr, alpn)
             .await
             .std_context(format!("error connecting to {remote_endpoint_id}"))?;
+        tracing::info!("connected to {}", remote_endpoint_id);
         let (mut endpoint_send, endpoint_recv) = connection
             .open_bi()
             .await
@@ -576,10 +766,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         if handshake {
             // the connecting side must write first. we don't know if there will be something
             // on stdin, so just write a handshake.
-            endpoint_send
-                .write_all(&dumbpipe::HANDSHAKE)
-                .await
-                .anyerr()?;
+            write_handshake(&mut endpoint_send).await?;
         }
         forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
         Ok::<_, AnyError>(())
@@ -636,6 +823,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     if args.common.verbose > 0 {
         eprintln!("or:\ndumbpipe connect-tcp {short}");
     }
+    tracing::info!("waiting for connections");
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
     tracing::info!(
         "relay url is {:?}",
@@ -662,9 +850,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
         if handshake {
             // read the handshake and verify it
-            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+            read_handshake(&mut r).await?;
         }
         let connection = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
@@ -742,12 +928,21 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
             .next()
             .map_or("None".to_string(), |url| url.to_string())
     );
+    let alpn = udp_alpn(&args.common)?;
+    tracing::debug!(
+        "alpn is {} (hex {})",
+        String::from_utf8_lossy(&alpn),
+        hex::encode(&alpn)
+    );
+    let stats = stats_enabled(args.common.verbosity());
+    tracing::info!("waiting for connections");
 
     // handle a new incoming connection on the endpoint
     async fn handle_endpoint_accept(
         accepting: Accepting,
         target: SocketAddr,
         handshake: bool,
+        stats: bool,
     ) -> Result<()> {
         let connection = accepting.await.std_context("error accepting connection")?;
         let remote_endpoint_id = &connection.remote_id();
@@ -763,13 +958,12 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
         tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
         if handshake {
             // read the handshake and verify it
-            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            recv.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+            read_handshake(&mut recv).await?;
+            tracing::debug!("handshake verified for {remote_endpoint_id}");
         }
         let socket = Arc::new(udp::bind_for(target).await?);
         tracing::info!("forwarding datagrams between {remote_endpoint_id} and udp://{target}");
-        udp::bridge(connection, socket, Some(target)).await?;
+        udp::bridge(connection, socket, Some(target), stats).await?;
         Ok(())
     }
 
@@ -794,7 +988,7 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
         };
         let handshake = !args.common.is_custom_alpn();
         tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(accepting, target, handshake).await {
+            if let Err(cause) = handle_endpoint_accept(accepting, target, handshake, stats).await {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -828,11 +1022,22 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
             .await
             .std_context(format!("error binding udp socket to {addr}"))?,
     );
-    tracing::info!("udp listening on udp://{}", addr);
+    tracing::info!(
+        "udp listening on udp://{}",
+        socket
+            .local_addr()
+            .std_context("error getting local address")?
+    );
 
     let remote_addr = args.ticket.endpoint_addr();
     let remote_endpoint_id = remote_addr.id;
     let alpn = udp_alpn(&args.common)?;
+    tracing::debug!(
+        "dialing {remote_endpoint_id} with alpn {} (hex {})",
+        String::from_utf8_lossy(&alpn),
+        hex::encode(&alpn)
+    );
+    tracing::info!("connecting to {}", remote_endpoint_id);
     let connection = endpoint
         .connect(remote_addr.clone(), &alpn)
         .await
@@ -848,14 +1053,15 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
     // when using a custom alpn, everything is up to the user
     if !args.common.is_custom_alpn() {
         // the connecting side must write first, so just write a handshake.
-        send.write_all(&dumbpipe::HANDSHAKE).await.anyerr()?;
+        write_handshake(&mut send).await?;
     }
     // keep the stream open for the lifetime of the tunnel
     let _stream = (send, recv);
     tracing::info!("tunnel established, forwarding udp to {remote_endpoint_id}");
 
+    let stats = stats_enabled(args.common.verbosity());
     tokio::select! {
-        res = udp::bridge(connection.clone(), socket, None) => {
+        res = udp::bridge(connection.clone(), socket, None, stats) => {
             res?;
         }
         _ = tokio::signal::ctrl_c() => {
@@ -863,6 +1069,7 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
         }
     }
 
+    tracing::info!("closing connection to {}", remote_endpoint_id);
     connection.close(0u32.into(), b"udp tunnel closed");
     endpoint.close().await;
     Ok(())
@@ -905,6 +1112,7 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         eprintln!("or:\ndumbpipe connect-unix --socket-path /path/to/client.sock {short}");
         eprintln!("dumbpipe connect-tcp --addr 127.0.0.1:8080 {short}");
     }
+    tracing::info!("waiting for connections");
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
     tracing::info!(
         "relay url is {:?}",
@@ -933,9 +1141,7 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         if handshake {
             // read the handshake and verify it
             tracing::trace!("reading handshake");
-            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await.anyerr()?;
-            ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+            read_handshake(&mut r).await?;
             tracing::trace!("handshake verified");
         }
         tracing::trace!("connecting to backend socket {:?}", socket_path);
@@ -1062,10 +1268,7 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
             tracing::trace!("sending handshake");
             // the connecting side must write first. we don't know if there will be something
             // on stdin, so just write a handshake.
-            endpoint_send
-                .write_all(&dumbpipe::HANDSHAKE)
-                .await
-                .anyerr()?;
+            write_handshake(&mut endpoint_send).await?;
             tracing::trace!("handshake sent");
         }
 
@@ -1115,8 +1318,8 @@ async fn generate_ticket() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let args = Args::parse();
+    init_logging(args.command.common());
     let res = match args.command {
         Commands::GenerateTicket => generate_ticket().await,
         Commands::Listen(args) => listen_stdio(args).await,
@@ -1138,5 +1341,57 @@ async fn main() -> Result<()> {
             eprintln!("error: {e}");
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn common(verbose: u8, verbose_max: u8) -> CommonArgs {
+        CommonArgs {
+            ipv4_addr: None,
+            ipv6_addr: None,
+            custom_alpn: None,
+            verbose,
+            verbose_max,
+        }
+    }
+
+    #[test]
+    fn verbosity_defaults_to_quiet() {
+        assert_eq!(common(0, MAX_VERBOSE).verbosity(), 0);
+        assert_eq!(log_level(0), Level::ERROR);
+    }
+
+    #[test]
+    fn verbosity_maps_to_levels() {
+        assert_eq!(common(1, MAX_VERBOSE).verbosity(), 1);
+        assert_eq!(log_level(1), Level::INFO);
+        assert_eq!(common(2, MAX_VERBOSE).verbosity(), 2);
+        assert_eq!(log_level(2), Level::DEBUG);
+        assert_eq!(common(3, MAX_VERBOSE).verbosity(), 3);
+        assert_eq!(log_level(3), Level::TRACE);
+    }
+
+    #[test]
+    fn verbose_max_caps_verbosity() {
+        // -v -v -v with --verbose-max 1 is just info
+        assert_eq!(common(3, 1).verbosity(), 1);
+        assert_eq!(log_level(common(3, 1).verbosity()), Level::INFO);
+        // --verbose-max above the maximum is clamped to the maximum
+        assert_eq!(common(10, 100).verbosity(), MAX_VERBOSE);
+        // --verbose-max 0 mutes everything
+        assert_eq!(common(5, 0).verbosity(), 0);
+        // a lower verbose count is unaffected by a higher cap
+        assert_eq!(common(2, 3).verbosity(), 2);
+    }
+
+    #[test]
+    fn stats_start_at_debug() {
+        assert!(!stats_enabled(0));
+        assert!(!stats_enabled(1));
+        assert!(stats_enabled(2));
+        assert!(stats_enabled(3));
     }
 }
