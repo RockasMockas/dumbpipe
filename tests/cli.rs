@@ -1,10 +1,10 @@
 #![cfg_attr(target_os = "windows", allow(unused_imports, dead_code))]
 use std::{
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     str::FromStr,
     sync::{Arc, Barrier},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dumbpipe::EndpointTicket;
@@ -291,6 +291,122 @@ fn connect_tcp_happy() {
     let mut buf = Vec::new();
     conn.read_to_end(&mut buf).unwrap();
     assert_eq!(&buf, b"hello from listen\n");
+}
+
+/// Integration test for udp datagram tunneling.
+///
+/// A dummy udp echo server stands in for an application that does its own
+/// retransmission, like an SRT listener.
+///
+/// - `listen-udp` forwards datagrams to the echo server.
+/// - `connect-udp` exposes a local udp port that feeds the tunnel.
+/// - Small datagrams must survive the round trip, oversized ones (larger than
+///   what fits into a single QUIC datagram) must be dropped without killing the
+///   tunnel.
+#[test]
+fn udp_roundtrip() {
+    /// Drain all pending datagrams, so that a late reply to a previous probe
+    /// cannot be mistaken for the reply we are waiting for.
+    fn drain(sock: &UdpSocket, buf: &mut [u8]) {
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        while sock.recv_from(buf).is_ok() {}
+    }
+
+    /// Send a datagram of `size` bytes and wait for it to come back.
+    ///
+    /// Keeps probing until `timeout` has passed, since establishing the
+    /// connection and learning the peer address takes a moment.
+    fn roundtrip(
+        sock: &UdpSocket,
+        addr: SocketAddr,
+        size: usize,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Option<usize> {
+        drain(sock, buf);
+        let data = vec![b'x'; size];
+        let deadline = Instant::now() + timeout;
+        loop {
+            sock.send_to(&data, addr).unwrap();
+            match sock.recv_from(buf) {
+                Ok((len, _)) => return Some(len),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) && Instant::now() < deadline =>
+                {
+                    continue;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    let echo_port = random_port();
+    let tunnel_port = random_port();
+    let echo_addr: SocketAddr = format!("127.0.0.1:{echo_port}").parse().unwrap();
+    let tunnel_addr: SocketAddr = format!("127.0.0.1:{tunnel_port}").parse().unwrap();
+
+    // start a dummy udp echo server
+    std::thread::spawn(move || {
+        let server = UdpSocket::bind(("127.0.0.1", echo_port)).unwrap();
+        let mut buf = [0u8; 65535];
+        while let Ok((len, from)) = server.recv_from(&mut buf) {
+            let _ = server.send_to(&buf[..len], from);
+        }
+    });
+
+    // forward incoming datagrams to the echo server
+    let mut listen_udp = duct::cmd(
+        dumbpipe_bin(),
+        ["listen-udp", "--host", &echo_addr.to_string()],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout()
+    .reader()
+    .unwrap();
+    let header = read_ascii_lines(4, &mut listen_udp).unwrap();
+    let header = String::from_utf8(header).unwrap();
+    let ticket = header.split_ascii_whitespace().last().unwrap();
+    let ticket = EndpointTicket::from_str(ticket).unwrap().to_string();
+
+    // expose a local udp port that feeds the tunnel
+    let _connect_udp = duct::cmd(
+        dumbpipe_bin(),
+        ["connect-udp", "--addr", &tunnel_addr.to_string(), &ticket],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_null()
+    .reader()
+    .unwrap();
+
+    // an unconnected socket, so that icmp errors do not poison the tunnel
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; 65535];
+
+    // datagrams that fit into a quic datagram must come back unchanged
+    for size in [10usize, 500, 1000] {
+        let reply = roundtrip(
+            &client,
+            tunnel_addr,
+            size,
+            &mut buf,
+            Duration::from_secs(20),
+        );
+        assert_eq!(
+            reply,
+            Some(size),
+            "{size} byte datagram did not survive the tunnel"
+        );
+    }
+
+    // an oversized datagram must be dropped, and must not take the tunnel down
+    let reply = roundtrip(&client, tunnel_addr, 4096, &mut buf, Duration::from_secs(2));
+    assert_eq!(reply, None, "oversized datagram should have been dropped");
+    let reply = roundtrip(&client, tunnel_addr, 100, &mut buf, Duration::from_secs(20));
+    assert_eq!(reply, Some(100), "tunnel should still work after a drop");
 }
 
 /// Integration test for Unix-domain socket tunneling.

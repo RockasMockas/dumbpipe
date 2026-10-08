@@ -1,8 +1,11 @@
 //! Command line arguments.
+mod udp;
+
 use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,6 +18,7 @@ use iroh::{
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
     select,
     time::timeout,
 };
@@ -84,6 +88,30 @@ pub enum Commands {
     /// As far as the endpoint is concerned, this is connecting. But it is
     /// listening on a TCP socket for which you have to specify the interface and port.
     ConnectTcp(ConnectTcpArgs),
+
+    /// Listen on an endpoint and forward incoming QUIC datagrams to the
+    /// specified UDP host and port, and replies back over the same connection.
+    ///
+    /// Will print a endpoint ticket on stderr that can be used to connect.
+    ///
+    /// As far as the endpoint is concerned, this is listening. But it is
+    /// sending and receiving UDP datagrams for which you have to specify the
+    /// host and port.
+    ///
+    /// Datagrams are unreliable and unordered, but preserve message
+    /// boundaries and are not subject to head-of-line blocking. This makes
+    /// this subcommand pair suitable for protocols that do their own
+    /// retransmission and timing, such as SRT.
+    ListenUdp(ListenUdpArgs),
+
+    /// Listen on a local UDP address and forward all received datagrams to an
+    /// endpoint, and replies back to the address that sent them.
+    ///
+    /// A endpoint ticket is required to connect.
+    ///
+    /// As far as the endpoint is concerned, this is connecting. But it is
+    /// listening on a UDP socket for which you have to specify the address.
+    ConnectUdp(ConnectUdpArgs),
 
     #[cfg(unix)]
     /// Listen on an endpoint and forward incoming connections to the specified
@@ -162,6 +190,17 @@ fn parse_alpn(alpn: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// The ALPN to use for a udp tunnel.
+///
+/// Unless a custom ALPN is given, the dedicated udp ALPN is used instead of
+/// the stream ALPN, so that udp and stream tunnels cannot be confused.
+fn udp_alpn(common: &CommonArgs) -> Result<Vec<u8>> {
+    Ok(match &common.custom_alpn {
+        Some(alpn) => parse_alpn(alpn)?,
+        None => udp::ALPN.to_vec(),
+    })
+}
+
 #[derive(Parser, Debug)]
 pub struct ListenArgs {
     /// Immediately close our sending side, indicating that we will not transmit any data
@@ -186,6 +225,37 @@ pub struct ConnectTcpArgs {
     /// The addresses to listen on for incoming tcp connections.
     ///
     /// To listen on all network interfaces, use 0.0.0.0:12345
+    #[clap(long)]
+    pub addr: String,
+
+    /// The endpoint to connect to
+    pub ticket: EndpointTicket,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListenUdpArgs {
+    /// The UDP host and port that incoming datagrams are forwarded to.
+    ///
+    /// Replies from that host and port are forwarded back over the tunnel.
+    ///
+    /// To forward to a local SRT listener, use 127.0.0.1:9000
+    #[clap(long)]
+    pub host: String,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ConnectUdpArgs {
+    /// The UDP address to listen on for incoming datagrams.
+    ///
+    /// Datagrams received here are forwarded to the endpoint in the ticket.
+    ///
+    /// To listen on all network interfaces, use 0.0.0.0:9001
     #[clap(long)]
     pub addr: String,
 
@@ -638,6 +708,166 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     Ok(())
 }
 
+/// Listen on an endpoint and forward incoming datagrams to a udp address.
+///
+/// Each incoming connection gets its own ephemeral udp socket, so that
+/// multiple connectors become multiple independent flows towards the target.
+async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
+    let target = udp::resolve(&args.host)?;
+    let secret_key = get_or_create_secret()?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![udp_alpn(&args.common)?]).await?;
+    // wait for the endpoint to figure out its address before making a ticket
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+    let addr = endpoint.addr();
+    let short = create_short_ticket(&addr);
+    let ticket = EndpointTicket::new(addr);
+
+    // print the ticket on stderr so it doesn't interfere with the data itself
+    //
+    // note that the tests rely on the ticket being the last thing printed
+    eprintln!("Forwarding incoming datagrams to udp://{target}.");
+    eprintln!("To connect, use e.g.:");
+    eprintln!("dumbpipe connect-udp --addr 127.0.0.1:9001 {ticket}");
+    if args.common.verbose > 0 {
+        eprintln!("or:\ndumbpipe connect-udp --addr 127.0.0.1:9001 {short}");
+    }
+    tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
+    tracing::info!(
+        "relay url is {:?}",
+        ticket
+            .endpoint_addr()
+            .relay_urls()
+            .next()
+            .map_or("None".to_string(), |url| url.to_string())
+    );
+
+    // handle a new incoming connection on the endpoint
+    async fn handle_endpoint_accept(
+        accepting: Accepting,
+        target: SocketAddr,
+        handshake: bool,
+    ) -> Result<()> {
+        let connection = accepting.await.std_context("error accepting connection")?;
+        let remote_endpoint_id = &connection.remote_id();
+        tracing::info!("got connection from {}", remote_endpoint_id);
+        // The udp flow belongs to this connection. The bidi stream opened by the
+        // connecting side is only used for the handshake, but is kept open for
+        // the lifetime of the tunnel as a liveness signal, while the datagrams
+        // ride along on the same connection.
+        let (_send, mut recv) = connection
+            .accept_bi()
+            .await
+            .std_context("error accepting stream")?;
+        tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+        if handshake {
+            // read the handshake and verify it
+            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
+            recv.read_exact(&mut buf).await.anyerr()?;
+            ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+        }
+        let socket = Arc::new(udp::bind_for(target).await?);
+        tracing::info!("forwarding datagrams between {remote_endpoint_id} and udp://{target}");
+        udp::bridge(connection, socket, Some(target)).await?;
+        Ok(())
+    }
+
+    loop {
+        let incoming = select! {
+            incoming = endpoint.accept() => incoming,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("got ctrl-c, exiting");
+                break;
+            }
+        };
+        let Some(incoming) = incoming else {
+            break;
+        };
+        let accepting = match incoming.accept() {
+            Ok(accepting) => accepting,
+            Err(err) => {
+                tracing::warn!("error accepting connection: {err}");
+                // if accept fails, we want to continue accepting connections
+                continue;
+            }
+        };
+        let handshake = !args.common.is_custom_alpn();
+        tokio::spawn(async move {
+            if let Err(cause) = handle_endpoint_accept(accepting, target, handshake).await {
+                // log error at warn level
+                //
+                // we should know about it, but it's not fatal
+                tracing::warn!("error handling connection: {}", cause);
+            }
+        });
+    }
+    endpoint.close().await;
+    Ok(())
+}
+
+/// Listen on a udp address and forward incoming datagrams to an endpoint.
+///
+/// Datagrams coming back from the endpoint are sent to whichever local address
+/// most recently sent a datagram, which is what a single client, e.g. an SRT
+/// caller, needs.
+async fn connect_udp(args: ConnectUdpArgs) -> Result<()> {
+    let addr = udp::resolve(&args.addr)?;
+    let secret_key = get_or_create_secret()?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![])
+        .await
+        .std_context("unable to bind endpoint")?;
+
+    // Wait for our own endpoint to be ready before trying to connect.
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+
+    let socket = Arc::new(
+        UdpSocket::bind(addr)
+            .await
+            .std_context(format!("error binding udp socket to {addr}"))?,
+    );
+    tracing::info!("udp listening on udp://{}", addr);
+
+    let remote_addr = args.ticket.endpoint_addr();
+    let remote_endpoint_id = remote_addr.id;
+    let alpn = udp_alpn(&args.common)?;
+    let connection = endpoint
+        .connect(remote_addr.clone(), &alpn)
+        .await
+        .std_context(format!("error connecting to {remote_endpoint_id}"))?;
+    tracing::info!("connected to {}", remote_endpoint_id);
+
+    // open a bidi stream, try only once
+    let (mut send, recv) = connection
+        .open_bi()
+        .await
+        .std_context(format!("error opening bidi stream to {remote_endpoint_id}"))?;
+    // send the handshake unless we are using a custom alpn
+    // when using a custom alpn, everything is up to the user
+    if !args.common.is_custom_alpn() {
+        // the connecting side must write first, so just write a handshake.
+        send.write_all(&dumbpipe::HANDSHAKE).await.anyerr()?;
+    }
+    // keep the stream open for the lifetime of the tunnel
+    let _stream = (send, recv);
+    tracing::info!("tunnel established, forwarding udp to {remote_endpoint_id}");
+
+    tokio::select! {
+        res = udp::bridge(connection.clone(), socket, None) => {
+            res?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("got ctrl-c, exiting");
+        }
+    }
+
+    connection.close(0u32.into(), b"udp tunnel closed");
+    endpoint.close().await;
+    Ok(())
+}
+
 /// Creates a ticket that only includes the id and any relay urls
 fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
     let mut short = EndpointAddr::new(addr.id);
@@ -893,6 +1123,8 @@ async fn main() -> Result<()> {
         Commands::ListenTcp(args) => listen_tcp(args).await,
         Commands::Connect(args) => connect_stdio(args).await,
         Commands::ConnectTcp(args) => connect_tcp(args).await,
+        Commands::ListenUdp(args) => listen_udp(args).await,
+        Commands::ConnectUdp(args) => connect_udp(args).await,
 
         #[cfg(unix)]
         Commands::ListenUnix(args) => listen_unix(args).await,

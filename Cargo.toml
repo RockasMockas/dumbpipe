@@ -14,6 +14,7 @@ readme = "README.md"
 rust-version = "1.91"
 
 [dependencies]
+bytes = "1"
 clap = { version = "4.4.10", features = ["derive"] }
 hex = "0.4.3"
 iroh = { version = "1.0.0", default-features = false, features = ["tls-ring"] }
@@ -28,9 +29,13 @@ n0-error = "1.0.0"
 
 [dev-dependencies]
 duct = "1.1.1"
-nix = { version = "0.31", features = ["signal", "process"] }
 rand = "0.10"
 tempfile = "3.8"
+
+# Unix-only: `nix` does not compile on Windows, so it must not be a
+# platform-independent dev-dependency.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [profile.release]
 panic = "abort"
