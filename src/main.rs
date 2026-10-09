@@ -492,11 +492,12 @@ pub struct ConnectWhipArgs {
 
     /// How much jitter buffer to give the player, in milliseconds.
     ///
-    /// The default is the lowest latency, which is right on a local network.
-    /// Across a country or an ocean the path jitters, reorders and drops
-    /// packets, and a receiver with no buffer drops them too: you get decode
-    /// errors and audio that drifts out of sync. Set this to 200-500 for a
-    /// long-distance link and the player will absorb the jitter instead.
+    /// Without this the player buffers automatically by the path: a local
+    /// network stays at the lowest latency, a long-distance path (round trip
+    /// of 50 ms or more) gets four round trips, clamped to 150-500 ms, so
+    /// the player absorbs the jitter instead of dropping reordered packets
+    /// with `max delay reached` and corrupt pictures. Set this explicitly to
+    /// override, e.g. 200-500 for a long-distance link.
     #[clap(long)]
     pub buffer: Option<u64>,
 

@@ -13,9 +13,16 @@
 //! * [`TAG_AUDIO`]: a complete RTP packet for the audio media.
 //! * [`TAG_KEYFRAME_REQ`]: viewer to host, please ask the publisher for a
 //!   keyframe.
+//! * [`TAG_FRAGMENT`]: a fragment of a datagram that was too large for a
+//!   single QUIC datagram, see [`fragment_all`] and [`Reassembler`].
 //!
 //! RTP header extensions and CSRCs are dropped when re-framing, the generated
 //! player SDP advertises neither.
+
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use data_encoding::{BASE64, HEXLOWER};
 
@@ -29,6 +36,158 @@ pub const TAG_VIDEO: u8 = 2;
 pub const TAG_AUDIO: u8 = 3;
 /// A viewer asking the host to request a keyframe from the publisher.
 pub const TAG_KEYFRAME_REQ: u8 = 4;
+/// A fragment of a datagram that did not fit into a single QUIC datagram.
+///
+/// The host fragments such a datagram instead of dropping it: on a local
+/// network the path MTU is large and nothing is ever fragmented, but across a
+/// continent QUIC's datagram limit settles near 1100 bytes and full-size RTP
+/// packets would otherwise be lost on every frame.
+pub const TAG_FRAGMENT: u8 = 5;
+
+/// The length of the fragment framing: tag, id, index, total.
+pub const FRAG_HEADER_LEN: usize = 5;
+
+/// How long a partial fragment set survives before it is discarded.
+///
+/// Realtime media that arrives later than this is useless anyway, and the
+/// keyframe gate recovers the stream at the next IDR.
+const FRAG_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The number of datagrams the [`Reassembler`] tracks at once.
+const FRAG_PENDING: usize = 8;
+
+/// Split a datagram that is too large into fragments that fit into `max`
+/// bytes each.
+///
+/// Returns `None` if the datagram cannot be framed (an absurd `max`) or would
+/// need more fragments than the one byte index can count.
+pub fn fragment_all(buf: &[u8], id: u16, max: usize) -> Option<Vec<Vec<u8>>> {
+    if max <= FRAG_HEADER_LEN {
+        return None;
+    }
+    let chunk = max - FRAG_HEADER_LEN;
+    let total = buf.len().div_ceil(chunk);
+    if total == 0 || total > u8::MAX as usize {
+        return None;
+    }
+    Some(
+        buf.chunks(chunk)
+            .enumerate()
+            .map(|(i, part)| fragment(id, i as u8, total as u8, part))
+            .collect(),
+    )
+}
+
+/// Frame one fragment of a datagram.
+///
+/// The framing is `tag, id(2), index(1), total(1)` followed by the chunk. The
+/// id groups the fragments of one datagram, so a reassembler can track several
+/// datagrams at once and tolerate fragments arriving out of order.
+pub fn fragment(id: u16, index: u8, total: u8, chunk: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(FRAG_HEADER_LEN + chunk.len());
+    buf.push(TAG_FRAGMENT);
+    buf.extend_from_slice(&id.to_be_bytes());
+    buf.push(index);
+    buf.push(total);
+    buf.extend_from_slice(chunk);
+    buf
+}
+
+/// The fragments collected for one datagram id.
+struct Assembling {
+    /// The number of fragments the datagram was split into.
+    total: usize,
+    /// The parts seen so far, `None` where a fragment is still missing.
+    parts: Vec<Option<Vec<u8>>>,
+    /// How many parts are filled.
+    got: usize,
+    /// When the first fragment of this datagram arrived.
+    at: Instant,
+}
+
+/// Reassembles fragmented datagrams.
+///
+/// Fragments may arrive out of order and duplicates are ignored; a datagram is
+/// yielded exactly once, when its last fragment arrives. Incomplete sets are
+/// dropped after [`FRAG_TIMEOUT`] or when more than [`FRAG_PENDING`] datagrams
+/// are being tracked: the missing fragments are then simply packet loss, and
+/// the viewer's keyframe gate recovers from that.
+#[derive(Default)]
+pub struct Reassembler {
+    pending: HashMap<u16, Assembling>,
+}
+
+impl Reassembler {
+    /// Feed one fragment datagram (starting with [`TAG_FRAGMENT`]).
+    ///
+    /// Returns the complete datagram, including its original tag byte, when
+    /// the last fragment of the datagram arrives.
+    pub fn push(&mut self, data: &[u8], now: Instant) -> Option<Vec<u8>> {
+        if data.len() < FRAG_HEADER_LEN || data[0] != TAG_FRAGMENT {
+            return None;
+        }
+        let id = u16::from_be_bytes([data[1], data[2]]);
+        let index = data[3] as usize;
+        let total = data[4] as usize;
+        if total == 0 || index >= total {
+            return None;
+        }
+        self.evict(now);
+        if !self.pending.contains_key(&id) && self.pending.len() >= FRAG_PENDING {
+            self.drop_oldest();
+        }
+        let entry = self.pending.entry(id).or_insert_with(|| Assembling {
+            total,
+            parts: vec![None; total],
+            got: 0,
+            at: now,
+        });
+        if entry.total != total {
+            // A reused id with a different framing, e.g. after the host's
+            // MTU estimate changed: start over.
+            *entry = Assembling {
+                total,
+                parts: vec![None; total],
+                got: 0,
+                at: now,
+            };
+        }
+        if entry.parts[index].is_some() {
+            return None;
+        }
+        entry.parts[index] = Some(data[FRAG_HEADER_LEN..].to_vec());
+        entry.got += 1;
+        if entry.got < total {
+            return None;
+        }
+        let entry = self.pending.remove(&id)?;
+        Some(entry.parts.into_iter().flatten().flatten().collect())
+    }
+
+    /// Discard all partial datagrams.
+    ///
+    /// Called at an epoch: fragments of the old GOP are useless now.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Drop entries that timed out.
+    fn evict(&mut self, now: Instant) {
+        self.pending.retain(|_, e| now.duration_since(e.at) < FRAG_TIMEOUT);
+    }
+
+    /// Drop the oldest entry to make room for a new one.
+    fn drop_oldest(&mut self) {
+        let oldest = self
+            .pending
+            .iter()
+            .min_by_key(|(_, e)| e.at)
+            .map(|(id, _)| *id);
+        if let Some(id) = oldest {
+            self.pending.remove(&id);
+        }
+    }
+}
 
 /// The length of a fixed RTP header without extensions or CSRCs.
 pub const RTP_HEADER_LEN: usize = 12;
@@ -494,5 +653,81 @@ mod tests {
     #[test]
     fn tagging_prefixes() {
         assert_eq!(tagged(TAG_VIDEO, b"abc"), vec![TAG_VIDEO, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn fragments_roundtrip() {
+        // A 100 byte datagram split at a 40 byte limit is three fragments,
+        // each within the limit, and they reassemble to exactly the original.
+        let original: Vec<u8> = (0..100u8).collect();
+        let frags = fragment_all(&original, 7, 40).expect("fragments");
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|f| f.len() <= 40));
+
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        assert!(r.push(&frags[0], now).is_none());
+        assert!(r.push(&frags[2], now).is_none(), "the last fragment is still missing");
+        assert_eq!(r.push(&frags[1], now).expect("complete"), original);
+    }
+
+    #[test]
+    fn fragments_tolerate_order_dupes_and_interleaving() {
+        let original: Vec<u8> = (0..50u8).collect();
+        let other: Vec<u8> = (200..250u8).collect();
+        let frags = fragment_all(&original, 1, 25).expect("fragments");
+        let other_frags = fragment_all(&other, 2, 25).expect("fragments");
+        assert_eq!(frags.len(), 3);
+
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        // out of order and interleaved with another datagram, with a dupe
+        assert!(r.push(&other_frags[0], now).is_none());
+        assert!(r.push(&frags[2], now).is_none());
+        assert!(r.push(&frags[2], now).is_none(), "a dupe is not complete twice");
+        assert!(r.push(&other_frags[1], now).is_none());
+        assert!(r.push(&frags[0], now).is_none());
+        assert_eq!(r.push(&frags[1], now).expect("complete"), original);
+        assert_eq!(r.push(&other_frags[1], now), None, "the dupe completed nothing");
+        assert_eq!(r.push(&other_frags[2], now).expect("complete"), other);
+    }
+
+    #[test]
+    fn stale_fragments_are_dropped() {
+        let frags = fragment_all(b"0123456789", 1, 8).expect("fragments");
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        assert!(r.push(&frags[0], now).is_none());
+        // past the timeout the partial set is gone, and the remaining
+        // fragments must not complete a lie
+        assert!(r.push(&frags[1], now + FRAG_TIMEOUT).is_none());
+        assert!(r.push(&frags[2], now + FRAG_TIMEOUT).is_none());
+        assert!(
+            r.push(&frags[3], now + FRAG_TIMEOUT).is_none(),
+            "the evicted first fragment must not be forgotten as present"
+        );
+    }
+
+    #[test]
+    fn clear_forgets_partial_datagrams() {
+        // 10 bytes at a 8 byte limit is four fragments of three bytes.
+        let frags = fragment_all(b"0123456789", 1, 8).expect("fragments");
+        assert_eq!(frags.len(), 4);
+        let mut r = Reassembler::default();
+        let now = Instant::now();
+        assert!(r.push(&frags[0], now).is_none());
+        r.clear();
+        // after the clear the old fragment is gone and must not count:
+        assert!(r.push(&frags[1], now).is_none());
+        assert!(r.push(&frags[2], now).is_none());
+        assert!(r.push(&frags[3], now).is_none(), "fragment 0 was cleared");
+        // ... and the datagram completes only when it arrives again
+        assert_eq!(r.push(&frags[0], now).expect("complete"), b"0123456789");
+    }
+
+    #[test]
+    fn fragment_rejects_absurd_limits() {
+        assert!(fragment_all(b"12345", 0, FRAG_HEADER_LEN).is_none());
+        assert!(fragment_all(&vec![0u8; 300], 0, 6).is_none(), "total > 255");
     }
 }

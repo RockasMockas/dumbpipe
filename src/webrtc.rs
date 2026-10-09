@@ -17,9 +17,12 @@
 //! logs `non-existing PPS` for every packet.
 //!
 //! The media path is unbuffered: every RTP packet is forwarded as one QUIC
-//! datagram as soon as it arrives, so there is no head-of-line blocking. Packets
-//! larger than the connection's `max_datagram_size()` are dropped and counted,
-//! never fragmented.
+//! datagram as soon as it arrives, so there is no head-of-line blocking. A
+//! packet larger than the connection's `max_datagram_size()` is fragmented into
+//! several datagrams and reassembled by the viewer, never dropped: on a local
+//! network nothing fragments, but across a continent the QUIC datagram limit
+//! sits near 1100 bytes and full-size RTP packets would otherwise be lost on
+//! every frame.
 
 use std::{
     io,
@@ -55,8 +58,8 @@ use tokio::{
 
 use crate::{
     rtp::{
-        self, Codec, ParameterSets, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_KEYFRAME_REQ, TAG_SESSION,
-        TAG_VIDEO,
+        self, Codec, ParameterSets, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_FRAGMENT,
+        TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO,
     },
     sdp::{self, MediaHeader, MediaKind, OfferMedia, SessionHeader},
     whip::{self, Answer, WhipRequest},
@@ -77,6 +80,16 @@ const HEADER_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a viewer waits for media before asking for a keyframe.
 const STALL_INTERVAL: Duration = Duration::from_secs(2);
+/// The shortest interval between two keyframe requests from one viewer.
+///
+/// On a lossy long-distance path almost every frame has a gap, and answering
+/// every gap with a PLI makes the encoder produce IDR after IDR, which blows
+/// up the bitrate and drops even more packets. One recovery per second is
+/// plenty.
+const KF_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// A path with at least this round-trip time counts as long-distance and gets
+/// an automatic jitter buffer for the player.
+const WAN_RTT: Duration = Duration::from_millis(50);
 /// How often a viewer reports that it is waiting for media.
 const WAIT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often periodic counters are logged while a tunnel runs.
@@ -209,6 +222,8 @@ struct Counters {
     unwanted: AtomicU64,
     /// Packets that could not be delivered.
     undeliverable: AtomicU64,
+    /// Fragment datagrams sent for packets too large for one datagram.
+    fragmented: AtomicU64,
     /// Keyframe requests.
     keyframes: AtomicU64,
 }
@@ -221,10 +236,11 @@ impl Counters {
     fn log_periodic(&self) {
         tracing::debug!(
             "webrtc tunnel stats: {} packets / {} bytes forwarded, \
-             {} oversized dropped, {} unwanted payload types dropped, \
+             {} fragmented, {} oversized dropped, {} unwanted payload types dropped, \
              {} undeliverable, {} keyframe requests",
             self.get(&self.forwarded),
             self.get(&self.forwarded_bytes),
+            self.get(&self.fragmented),
             self.get(&self.dropped),
             self.get(&self.unwanted),
             self.get(&self.undeliverable),
@@ -235,10 +251,11 @@ impl Counters {
     fn log_final(&self) {
         tracing::info!(
             "webrtc tunnel closed: {} packets / {} bytes forwarded, \
-             {} oversized dropped, {} unwanted payload types dropped, \
+             {} fragmented, {} oversized dropped, {} unwanted payload types dropped, \
              {} undeliverable, {} keyframe requests",
             self.get(&self.forwarded),
             self.get(&self.forwarded_bytes),
+            self.get(&self.fragmented),
             self.get(&self.dropped),
             self.get(&self.unwanted),
             self.get(&self.undeliverable),
@@ -246,14 +263,14 @@ impl Counters {
         );
     }
 
-    /// Record an oversized packet that had to be dropped.
+    /// Record a packet that could not even be fragmented.
     fn record_dropped(&self, size: usize, max: usize) {
         let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         // log the first one and then every 1000th, so a misconfigured sender
         // is visible without flooding the log.
         if count == 1 || count.is_multiple_of(1000) {
             tracing::warn!(
-                "dropped oversized rtp datagram ({size} > {max} bytes), \
+                "dropped unfragmentable rtp datagram ({size} > {max} bytes), \
                  {count} dropped so far; lower the packet size of the publisher",
             );
         }
@@ -652,6 +669,8 @@ async fn handle_viewer(accepting: Accepting, tx: mpsc::Sender<ViewerEvent>) -> R
         let conn = conn.clone();
         let counters = counters.clone();
         tokio::spawn(async move {
+            // The id of the next fragmented datagram.
+            let mut frag_id: u16 = 0;
             while let Some(frame) = frame_rx.recv().await {
                 let (tag, payload) = match frame {
                     Frame::Header(b) => (TAG_SESSION, b),
@@ -662,8 +681,32 @@ async fn handle_viewer(accepting: Accepting, tx: mpsc::Sender<ViewerEvent>) -> R
                 let mut buf = Vec::with_capacity(1 + payload.len());
                 buf.push(tag);
                 buf.extend_from_slice(&payload);
+                // The limit can move with the path MTU estimate, so ask on
+                // every packet rather than once.
+                let max = conn.max_datagram_size().unwrap_or(max);
                 if buf.len() > max {
-                    counters.record_dropped(buf.len(), max);
+                    // Too large for one datagram: fragment it instead of
+                    // dropping it. A lost fragment is plain packet loss, the
+                    // viewer's gap detection and keyframe gate recover from it.
+                    let frags = match rtp::fragment_all(&buf, frag_id, max) {
+                        Some(frags) => frags,
+                        None => {
+                            counters.record_dropped(buf.len(), max);
+                            continue;
+                        }
+                    };
+                    frag_id = frag_id.wrapping_add(1);
+                    for frag in frags {
+                        match conn.send_datagram(frag.into()) {
+                            Ok(()) => {
+                                counters.fragmented.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                tracing::debug!("cannot send fragment to viewer: {e}");
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
                 match conn.send_datagram(buf.into()) {
@@ -1438,6 +1481,25 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             .std_context("error connecting to the host")?;
         tracing::info!("connected to {}", cfg.addr.id);
 
+        // Pick the player's jitter buffer for this path. A local network stays
+        // at the lowest latency; a long-distance path gets a buffer sized by
+        // its round-trip time, otherwise the player's zero-buffer RTP receiver
+        // drops every reordered packet and the log fills with `max delay
+        // reached` and corrupt pictures.
+        let rtt = conn
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.rtt());
+        let buffer = auto_buffer(cfg.buffer, rtt);
+        if cfg.buffer.is_none() && buffer.is_some() {
+            eprintln!(
+                "long-distance path (rtt {} ms), buffering {} ms",
+                rtt.unwrap_or_default().as_millis(),
+                buffer.unwrap_or_default().as_millis(),
+            );
+        }
+
         let (mut send, recv) = conn
             .open_bi()
             .await
@@ -1455,6 +1517,10 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
         let mut header: Option<SessionHeader> = None;
         let mut forwarding = false;
         let mut last_seq: Option<u16> = None;
+        let mut last_kf: Option<Instant> = None;
+        // Datagrams the host had to fragment, reassembled before they are
+        // forwarded to the player.
+        let mut reassembler = rtp::Reassembler::default();
         let mut last_packet = tokio::time::Instant::now();
         let mut wait_tick = interval(WAIT_INTERVAL);
         wait_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1470,6 +1536,15 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         Err(e) => {
                             break Err(anyerr!("error reading datagrams from the host: {e}"));
                         }
+                    };
+                    // Reassemble fragmented datagrams and let the complete
+                    // datagram fall through to the dispatch below.
+                    let data = match data.first().copied() {
+                        Some(TAG_FRAGMENT) => match reassembler.push(&data, Instant::now()) {
+                            Some(full) => Bytes::from(full),
+                            None => continue,
+                        },
+                        _ => data,
                     };
                     match data.first().copied() {
                         Some(TAG_SESSION) => {
@@ -1492,19 +1567,22 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                                 }
                                 launched = signature;
                                 player =
-                                    launch(&cfg, &sdp_path, ports.video, &kf_tx, &exit_tx).await?;
+                                    launch(&cfg, buffer, &sdp_path, ports.video, &kf_tx, &exit_tx)
+                                        .await?;
                             }
                         }
                         Some(TAG_EPOCH) => {
                             if header.as_ref().is_some_and(|h| h.has_media()) {
                                 forwarding = true;
                                 last_seq = None;
+                                // fragments of the old GOP are dead now
+                                reassembler.clear();
                                 tracing::info!("streaming from a keyframe");
                             }
                         }
                         Some(tag @ (TAG_VIDEO | TAG_AUDIO)) if forwarding => {
                             let port = if tag == TAG_VIDEO { ports.video } else { ports.audio };
-                            forward(&video, &data[1..], port, &counters, &mut last_seq, tag == TAG_VIDEO, &kf_tx).await;
+                            forward(&video, &data[1..], port, &counters, &mut last_seq, &mut last_kf, tag == TAG_VIDEO, &kf_tx).await;
                             last_packet = tokio::time::Instant::now();
                         }
                         _ => {}
@@ -1573,6 +1651,20 @@ fn media_signature(header: &SessionHeader) -> String {
         .join(",")
 }
 
+/// The jitter buffer to give the player.
+///
+/// An explicit `--buffer` always wins. Otherwise the path decides: a local
+/// network stays at the lowest latency, a long-distance path gets four
+/// round-trip times, clamped to 150-500 ms. That is the reorder window the
+/// player waits for late packets; without it a path that jitters more than a
+/// few milliseconds drops intact packets and shows corrupt pictures.
+fn auto_buffer(configured: Option<Duration>, rtt: Option<Duration>) -> Option<Duration> {
+    configured.or_else(|| {
+        rtt.filter(|r| *r >= WAN_RTT)
+            .map(|r| (r * 4).clamp(Duration::from_millis(150), Duration::from_millis(500)))
+    })
+}
+
 /// Where the SDP file goes.
 ///
 /// An explicit path wins; a directory gets the default name inside it. With no
@@ -1607,9 +1699,11 @@ async fn write_sdp(path: &std::path::Path, sdp: &str) -> Result<()> {
 
 /// Launch the player and ask the host for a keyframe once it is listening.
 ///
+/// `buffer` is the jitter buffer for this path, see [`auto_buffer`].
 /// Returns `None` when no player is to be launched.
 async fn launch(
     cfg: &ViewerConfig,
+    buffer: Option<Duration>,
     sdp_path: &std::path::Path,
     video_port: u16,
     kf_tx: &mpsc::Sender<()>,
@@ -1627,14 +1721,14 @@ async fn launch(
         tracing::info!(
             "not launching a player, play with: {}",
             cfg.player
-                .command(sdp_path, cfg.buffer, cfg.player_path.as_deref())
+                .command(sdp_path, buffer, cfg.player_path.as_deref())
                 .join(" ")
         );
         return Ok(None);
     }
     let command = cfg
         .player
-        .command(sdp_path, cfg.buffer, cfg.player_path.as_deref());
+        .command(sdp_path, buffer, cfg.player_path.as_deref());
     let mut child = Command::new(&command[0])
         .args(&command[1..])
         .spawn()
@@ -1690,12 +1784,18 @@ async fn wait_until_listening(port: u16) {
 }
 
 /// Forward one RTP packet to the local player port.
+///
+/// A gap in the video sequence makes the viewer ask the host for a keyframe,
+/// but at most once per [`KF_REQUEST_INTERVAL`]: on a lossy path nearly every
+/// frame has a gap, and a PLI per gap turns into a keyframe storm that
+/// amplifies the loss instead of recovering from it.
 async fn forward(
     socket: &Arc<UdpSocket>,
     packet: &[u8],
     port: u16,
     counters: &Arc<Counters>,
     last_seq: &mut Option<u16>,
+    last_kf: &mut Option<Instant>,
     video: bool,
     kf_tx: &mpsc::Sender<()>,
 ) {
@@ -1724,7 +1824,9 @@ async fn forward(
     };
     let gap = last_seq.is_some_and(|last| info.seq != last.wrapping_add(1));
     *last_seq = Some(info.seq);
-    if gap {
+    let throttled = last_kf.is_some_and(|at| at.elapsed() < KF_REQUEST_INTERVAL);
+    if gap && !throttled {
+        *last_kf = Some(Instant::now());
         tracing::debug!("video sequence gap at {}, asking for a keyframe", info.seq);
         let _ = kf_tx.try_send(());
     }
@@ -1961,6 +2063,38 @@ mod tests {
     }
 
     #[test]
+    fn auto_buffer_follows_the_path_rtt() {
+        // An explicit buffer always wins, whatever the path says.
+        let explicit = Duration::from_millis(800);
+        assert_eq!(
+            auto_buffer(Some(explicit), Some(Duration::from_secs(1))),
+            Some(explicit)
+        );
+        assert_eq!(auto_buffer(Some(explicit), None), Some(explicit));
+        // A local path stays at the lowest latency.
+        assert_eq!(auto_buffer(None, None), None);
+        assert_eq!(auto_buffer(None, Some(Duration::from_millis(2))), None);
+        assert_eq!(auto_buffer(None, Some(Duration::from_millis(49))), None);
+        // A long-distance path gets four round-trips, clamped to 150-500 ms.
+        assert_eq!(
+            auto_buffer(None, Some(Duration::from_millis(50))),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            auto_buffer(None, Some(Duration::from_millis(80))),
+            Some(Duration::from_millis(320))
+        );
+        assert_eq!(
+            auto_buffer(None, Some(Duration::from_millis(120))),
+            Some(Duration::from_millis(480))
+        );
+        assert_eq!(
+            auto_buffer(None, Some(Duration::from_millis(300))),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
     fn play_ports_are_even_pairs() {
         let ports = PlayPorts::new("127.0.0.1:5004".parse().unwrap());
         assert_eq!((ports.video, ports.audio), (5004, 5006));
@@ -2055,6 +2189,7 @@ mod tests {
         let counters = Arc::new(Counters::default());
         let (kf_tx, mut kf_rx) = mpsc::channel(8);
         let mut last = None;
+        let mut last_kf = None;
 
         let packet = |seq: u16| rtp::serialize_rtp(&info(96, seq), b"frame");
 
@@ -2064,6 +2199,7 @@ mod tests {
             port,
             &counters,
             &mut last,
+            &mut last_kf,
             true,
             &kf_tx,
         )
@@ -2074,6 +2210,7 @@ mod tests {
             port,
             &counters,
             &mut last,
+            &mut last_kf,
             true,
             &kf_tx,
         )
@@ -2088,19 +2225,36 @@ mod tests {
             port,
             &counters,
             &mut last,
+            &mut last_kf,
             true,
             &kf_tx,
         )
         .await;
         assert_eq!(kf_rx.try_recv(), Ok(()), "a gap asks for a keyframe");
 
-        // audio is not a video sequence, its gaps mean nothing here
+        // a second gap within the throttle interval does not ask again: on a
+        // lossy path that would be a keyframe storm
         forward(
             &sender,
             &packet(30),
             port,
             &counters,
             &mut last,
+            &mut last_kf,
+            true,
+            &kf_tx,
+        )
+        .await;
+        assert!(kf_rx.try_recv().is_err(), "the second gap is throttled");
+
+        // audio is not a video sequence, its gaps mean nothing here
+        forward(
+            &sender,
+            &packet(40),
+            port,
+            &counters,
+            &mut last,
+            &mut last_kf,
             false,
             &kf_tx,
         )
@@ -2109,7 +2263,7 @@ mod tests {
 
         // the player must see exactly the bytes we were fed
         let mut buf = [0u8; 1024];
-        for seq in [10u16, 11, 20, 30] {
+        for seq in [10u16, 11, 20, 30, 40] {
             let (n, _) = player.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], &packet(seq)[..], "packet {seq}");
         }
@@ -2125,6 +2279,7 @@ mod tests {
         let counters = Arc::new(Counters::default());
         let (kf_tx, mut kf_rx) = mpsc::channel(8);
         let mut last = None;
+        let mut last_kf = None;
 
         forward(
             &sender,
@@ -2132,6 +2287,7 @@ mod tests {
             1,
             &counters,
             &mut last,
+            &mut last_kf,
             true,
             &kf_tx,
         )
@@ -2148,6 +2304,7 @@ mod tests {
             1,
             &counters,
             &mut last,
+            &mut last_kf,
             true,
             &kf_tx,
         )
