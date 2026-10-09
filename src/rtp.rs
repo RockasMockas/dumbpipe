@@ -189,6 +189,129 @@ impl Reassembler {
     }
 }
 
+/// How long the [`Reorder`] holds a packet waiting for a missing earlier one.
+///
+/// QUIC datagrams are unordered, so the viewer must put RTP packets back in
+/// sequence order for the player. This is how long it waits for a hole to be
+/// filled by a late packet before flushing what it has and letting the player
+/// conceal the gap. Long enough to cover typical reordering, short enough that
+/// the stream never visibly stalls.
+const REORDER_TIMEOUT: Duration = Duration::from_millis(80);
+
+/// The most packets the [`Reorder`] holds per media at once.
+///
+/// A bound on memory: if reordering is so bad that this many packets pile up,
+/// the stream is unusable anyway, so the held packets are flushed in order.
+const REORDER_CAP: usize = 256;
+
+/// Puts RTP packets back into sequence order.
+///
+/// The host forwards one RTP packet per QUIC datagram, and datagrams are
+/// unreliable *and unordered*, so packets reach the viewer scrambled even on a
+/// local network. Handing them to a player in arrival order makes it read the
+/// reordering as packet loss: `missed N packets`, a thrashing jitter buffer and
+/// corrupt pictures. The viewer runs one `Reorder` per media (video and audio
+/// have separate sequence spaces) and emits packets strictly in sequence order,
+/// so the player sees a clean, in-order stream.
+///
+/// A packet that arrives exactly when expected is emitted at once; a later one
+/// is held until the hole before it is filled. If a hole is not filled within
+/// [`REORDER_TIMEOUT`], everything held is flushed in sequence order and the hole
+/// is abandoned: the missing packet is genuine loss, which the player conceals.
+/// Packets older than the next expected (very late, or duplicates past a hole)
+/// are dropped.
+#[derive(Default)]
+pub struct Reorder {
+    /// The next sequence number to emit, `None` until the first packet.
+    next: Option<u16>,
+    /// Held packets, `(seq, arrival, packet)`, out of order.
+    held: Vec<(u16, Instant, Vec<u8>)>,
+}
+
+impl Reorder {
+    /// Feed one packet by its RTP sequence number.
+    ///
+    /// Returns the packets to hand to the player now, in sequence order: the
+    /// packet itself if it closes the gap, plus any held packets it unblocks.
+    pub fn push(&mut self, seq: u16, packet: Vec<u8>, now: Instant) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        match self.next {
+            None => {
+                // First packet: it is the baseline, emit it and wait for the next.
+                self.next = Some(seq.wrapping_add(1));
+                out.push(packet);
+            }
+            Some(next) => {
+                let ahead = seq.wrapping_sub(next) as i16;
+                if ahead < 0 {
+                    // Older than the next expected: too late, or a duplicate past
+                    // a hole we already flushed. Drop it.
+                    return out;
+                }
+                if ahead == 0 {
+                    out.push(packet);
+                    self.next = Some(next.wrapping_add(1));
+                    self.drain(&mut out);
+                } else {
+                    // A future packet: hold it until the hole before it is filled.
+                    if !self.held.iter().any(|(s, _, _)| *s == seq) {
+                        if self.held.len() >= REORDER_CAP {
+                            self.flush(&mut out);
+                        }
+                        self.held.push((seq, now, packet));
+                    }
+                    self.expire(now, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// Forget everything: called at an epoch, where the sequence baseline resets.
+    pub fn clear(&mut self) {
+        self.next = None;
+        self.held.clear();
+    }
+
+    /// Emit held packets that are now consecutive with the next expected.
+    fn drain(&mut self, out: &mut Vec<Vec<u8>>) {
+        while let Some(next) = self.next {
+            match self.held.iter().position(|(s, _, _)| *s == next) {
+                Some(i) => {
+                    let (s, _, p) = self.held.remove(i);
+                    out.push(p);
+                    self.next = Some(s.wrapping_add(1));
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Flush everything held if the oldest has waited past the timeout, so a
+    /// lost packet can never stall the stream.
+    fn expire(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
+        if self
+            .held
+            .iter()
+            .map(|(_, at, _)| now.duration_since(*at))
+            .max()
+            .is_some_and(|wait| wait >= REORDER_TIMEOUT)
+        {
+            self.flush(out);
+        }
+    }
+
+    /// Release all held packets in sequence order, abandoning the holes.
+    fn flush(&mut self, out: &mut Vec<Vec<u8>>) {
+        let next = self.next.unwrap_or(0);
+        self.held.sort_by_key(|(s, _, _)| s.wrapping_sub(next) as i16);
+        for (s, _, p) in self.held.drain(..) {
+            self.next = Some(s.wrapping_add(1));
+            out.push(p);
+        }
+    }
+}
+
 /// The length of a fixed RTP header without extensions or CSRCs.
 pub const RTP_HEADER_LEN: usize = 12;
 
@@ -729,5 +852,66 @@ mod tests {
     fn fragment_rejects_absurd_limits() {
         assert!(fragment_all(b"12345", 0, FRAG_HEADER_LEN).is_none());
         assert!(fragment_all(&vec![0u8; 300], 0, 6).is_none(), "total > 255");
+    }
+
+    #[test]
+    fn reorder_emits_in_order_packets_at_once() {
+        let mut r = Reorder::default();
+        let now = Instant::now();
+        assert_eq!(r.push(1, vec![1], now), vec![vec![1]]);
+        assert_eq!(r.push(2, vec![2], now), vec![vec![2]]);
+        assert_eq!(r.push(3, vec![3], now), vec![vec![3]]);
+    }
+
+    #[test]
+    fn reorder_holds_a_head_until_the_hole_is_filled() {
+        let mut r = Reorder::default();
+        let now = Instant::now();
+        assert_eq!(r.push(1, vec![1], now), vec![vec![1]]);
+        // 3 arrives before 2: hold it, emit nothing.
+        assert!(r.push(3, vec![3], now).is_empty(), "2 is still missing");
+        // 2 arrives late: it and the held 3 go out in order.
+        assert_eq!(r.push(2, vec![2], now), vec![vec![2], vec![3]]);
+        assert_eq!(r.push(4, vec![4], now), vec![vec![4]]);
+    }
+
+    #[test]
+    fn reorder_flushes_held_packets_after_the_timeout() {
+        let mut r = Reorder::default();
+        let t0 = Instant::now();
+        assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
+        // 2 is genuinely lost; 3 and 4 pile up behind the hole.
+        assert!(r.push(3, vec![3], t0).is_empty());
+        assert!(r.push(4, vec![4], t0).is_empty());
+        // once the oldest held packet has waited past the timeout, the next
+        // packet flushes everything in order and abandons the hole at 2.
+        let later = t0 + REORDER_TIMEOUT;
+        assert_eq!(r.push(5, vec![5], later), vec![vec![3], vec![4], vec![5]]);
+        // the stream resumes normally from the new baseline.
+        assert_eq!(r.push(6, vec![6], later), vec![vec![6]]);
+    }
+
+    #[test]
+    fn reorder_drops_packets_past_a_flushed_hole() {
+        let mut r = Reorder::default();
+        let t0 = Instant::now();
+        assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
+        assert!(r.push(3, vec![3], t0).is_empty());
+        // the hole at 2 is abandoned after the timeout
+        assert_eq!(r.push(4, vec![4], t0 + REORDER_TIMEOUT), vec![vec![3], vec![4]]);
+        // the very late 2 must not be emitted out of order now
+        assert!(r.push(2, vec![2], t0 + REORDER_TIMEOUT).is_empty(), "too late");
+    }
+
+    #[test]
+    fn reorder_clear_resets_the_baseline() {
+        let mut r = Reorder::default();
+        let now = Instant::now();
+        assert_eq!(r.push(5, vec![5], now), vec![vec![5]]);
+        assert!(r.push(7, vec![7], now).is_empty());
+        r.clear();
+        // after an epoch the baseline is gone: a new low sequence number is the
+        // start of a fresh GOP, not a late packet to drop.
+        assert_eq!(r.push(1, vec![1], now), vec![vec![1]]);
     }
 }

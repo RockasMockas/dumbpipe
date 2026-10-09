@@ -58,7 +58,7 @@ use tokio::{
 
 use crate::{
     rtp::{
-        self, Codec, ParameterSets, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_FRAGMENT,
+        self, Codec, ParameterSets, Reorder, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_FRAGMENT,
         TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO,
     },
     sdp::{self, MediaHeader, MediaKind, OfferMedia, SessionHeader},
@@ -1534,6 +1534,12 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
         // Datagrams the host had to fragment, reassembled before they are
         // forwarded to the player.
         let mut reassembler = rtp::Reassembler::default();
+        // QUIC datagrams are unordered, so put each media back into RTP
+        // sequence order before the player sees it; otherwise ffplay reads the
+        // reordering as loss and corrupts the picture. Video and audio have
+        // separate sequence spaces, so each gets its own buffer.
+        let mut video_order = Reorder::default();
+        let mut audio_order = Reorder::default();
         let mut last_packet = tokio::time::Instant::now();
         let mut wait_tick = interval(WAIT_INTERVAL);
         wait_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1592,14 +1598,31 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                                 // refresh, so a gap right after it is not a loss and
                                 // we must not poke the encoder because of it.
                                 last_kf = Some(Instant::now());
-                                // fragments of the old GOP are dead now
+                                // fragments and out-of-order packets of the old GOP
+                                // are dead now; reset the sequence baseline too
                                 reassembler.clear();
+                                video_order.clear();
+                                audio_order.clear();
                                 tracing::info!("streaming from a keyframe");
                             }
                         }
                         Some(tag @ (TAG_VIDEO | TAG_AUDIO)) if forwarding => {
-                            let port = if tag == TAG_VIDEO { ports.video } else { ports.audio };
-                            forward(&video, &data[1..], port, &counters, &mut last_seq, &mut last_kf, tag == TAG_VIDEO, &kf_tx).await;
+                            let is_video = tag == TAG_VIDEO;
+                            let port = if is_video { ports.video } else { ports.audio };
+                            let packet = &data[1..];
+                            // Reorder by RTP sequence number before handing the
+                            // packet to the player, so the unordered datagram path
+                            // does not look like packet loss to ffplay.
+                            let order = if is_video { &mut video_order } else { &mut audio_order };
+                            let emit = match rtp::parse_header(packet) {
+                                Some((info, _)) => {
+                                    order.push(info.seq, packet.to_vec(), Instant::now())
+                                }
+                                None => vec![packet.to_vec()],
+                            };
+                            for pkt in emit {
+                                forward(&video, &pkt, port, &counters, &mut last_seq, &mut last_kf, is_video, &kf_tx).await;
+                            }
                             last_packet = tokio::time::Instant::now();
                         }
                         _ => {}
