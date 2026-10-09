@@ -94,18 +94,27 @@ mpv --no-cache --profile=low-latency --force-window=immediate /tmp/dumbpipe-5004
 
 The player is picked with `--player`:
 
-- `mpv` (default), the `low-latency` profile with no cache
+- `mpv` (default), the `low-latency` profile with no cache and
 - `ffplay`, with `-fflags nobuffer` and no analysis delay
 - `vlc`, with `--network-caching=100`
-- `none`, which only writes the SDP file and prints the command to run
+- `none`, which starts no player: it writes the stream description to
+  `dumbpipe-<port>.sdp` in the current folder and prints where it is, so you
+  can open it in a player yourself
 
 Other options:
 
+- `--player-path <path>` runs a player binary that is not on `PATH`. The flags
+  are still those of `--player`, which defaults to `mpv`: `--player-path
+  /opt/mpv` runs `/opt/mpv` with the mpv flags; `--player ffplay
+  --player-path /opt/ffplay` runs `/opt/ffplay` with the ffplay flags.
 - `--addr 127.0.0.1:5004` is the base of the local RTP ports. Video takes the
   even port (5004), its RTCP the port above (5005), audio the next pair
   (5006/5007). An odd port is rounded up.
-- `--sdp <path>` writes the stream description somewhere else than
-  `/tmp/dumbpipe-<port>.sdp`.
+- `--sdp` writes the stream description to the default file
+  (`dumbpipe-<port>.sdp`) in the current folder, so you can open it by hand.
+  Give a path with an equals sign, `--sdp=/tmp/mine.sdp`, to name it, or a
+  directory to put the default file inside it. Without `--sdp`, a launched
+  player keeps it in the system temp dir.
 - `--no-launch` does not start a player, so you can open the SDP file yourself,
   or point something else at the ports.
 - `--buffer <ms>` gives the player a jitter buffer. The default is the lowest

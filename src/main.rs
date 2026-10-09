@@ -475,6 +475,15 @@ pub struct ConnectWhipArgs {
     #[clap(long, value_enum, default_value_t = webrtc::Player::Mpv)]
     pub player: webrtc::Player,
 
+    /// The path to the player binary, for a player that is not on `PATH`.
+    ///
+    /// The flags are still those of `--player`, which defaults to `mpv`. So
+    /// `--player-path /opt/mpv` runs `/opt/mpv` with the mpv flags, and
+    /// `--player ffplay --player-path /opt/ffplay` runs `/opt/ffplay` with the
+    /// ffplay flags.
+    #[clap(long)]
+    pub player_path: Option<PathBuf>,
+
     /// Do not launch a player, only write the SDP file.
     ///
     /// The command line to play the stream yourself is printed instead.
@@ -1279,6 +1288,7 @@ async fn connect_whip(args: ConnectWhipArgs) -> Result<()> {
         sdp,
         sdp_here,
         player: args.player,
+        player_path: args.player_path.clone(),
         no_launch: args.no_launch,
         buffer: args.buffer.map(Duration::from_millis),
         stats: stats_enabled(args.common.verbosity()),

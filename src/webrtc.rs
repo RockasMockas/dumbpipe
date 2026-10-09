@@ -113,11 +113,29 @@ impl Player {
     /// a local network. Across a continent the path jitters and reorders packets,
     /// and a receiver with no buffer drops them, corrupts pictures and loses A/V
     /// sync; `buffer` then gives the player time to absorb that.
-    pub fn command(&self, sdp: &Path, buffer: Option<Duration>) -> Vec<String> {
+    ///
+    /// `path` overrides the player binary, for a player that is not on `PATH`.
+    pub fn command(
+        &self,
+        sdp: &Path,
+        buffer: Option<Duration>,
+        path: Option<&std::path::Path>,
+    ) -> Vec<String> {
         let file = sdp.display().to_string();
+        // The custom path replaces the binary name, the flags stay the player's.
+        let bin = |default: &str| {
+            path.map(|p| p.display().to_string())
+                .unwrap_or_else(|| default.to_string())
+        };
         match self {
             Player::Mpv => {
-                let mut cmd = vec!["mpv".to_string(), "--force-window=immediate".to_string()];
+                let mut cmd = vec![
+                    bin("mpv"),
+                    "--force-window=immediate".to_string(),
+                    // A live stream must start at the live edge, never resume a
+                    // watched position from a previous run.
+                    "--no-resume-playback".to_string(),
+                ];
                 match buffer {
                     Some(ms) => {
                         cmd.push("--cache=yes".into());
@@ -136,14 +154,14 @@ impl Player {
             Player::Vlc => {
                 let caching = buffer.map(|d| d.as_millis()).unwrap_or(100);
                 vec![
-                    "vlc".into(),
+                    bin("vlc"),
                     format!("--network-caching={caching}"),
                     "--no-loop".into(),
                     file,
                 ]
             }
             Player::Ffplay => {
-                let mut cmd = vec!["ffplay".to_string()];
+                let mut cmd = vec![bin("ffplay")];
                 match buffer {
                     Some(ms) => {
                         // Drop corrupt packets instead of feeding them to the
@@ -1337,6 +1355,8 @@ pub struct ViewerConfig {
     pub sdp_here: bool,
     /// The player to launch.
     pub player: Player,
+    /// An explicit path to the player binary, for a player not on `PATH`.
+    pub player_path: Option<std::path::PathBuf>,
     /// Whether to launch the player at all.
     pub no_launch: bool,
     /// How much jitter buffer to give the player, `None` for lowest latency.
@@ -1606,11 +1626,15 @@ async fn launch(
     if cfg.no_launch {
         tracing::info!(
             "not launching a player, play with: {}",
-            cfg.player.command(sdp_path, cfg.buffer).join(" ")
+            cfg.player
+                .command(sdp_path, cfg.buffer, cfg.player_path.as_deref())
+                .join(" ")
         );
         return Ok(None);
     }
-    let command = cfg.player.command(sdp_path, cfg.buffer);
+    let command = cfg
+        .player
+        .command(sdp_path, cfg.buffer, cfg.player_path.as_deref());
     let mut child = Command::new(&command[0])
         .args(&command[1..])
         .spawn()
@@ -1948,36 +1972,52 @@ mod tests {
     #[test]
     fn player_commands_are_low_latency() {
         let path = Path::new("/tmp/x.sdp");
-        let mpv = Player::Mpv.command(path, None);
+        let mpv = Player::Mpv.command(path, None, None);
         assert_eq!(mpv[0], "mpv");
         assert!(mpv.contains(&"--profile=low-latency".to_string()));
+        assert!(mpv.contains(&"--no-resume-playback".to_string()));
         assert_eq!(mpv.last().unwrap(), "/tmp/x.sdp");
         assert!(Player::Vlc
-            .command(path, None)
+            .command(path, None, None)
             .contains(&"--network-caching=100".to_string()));
         assert!(Player::Ffplay
-            .command(path, None)
+            .command(path, None, None)
             .contains(&"nobuffer".to_string()));
         assert!(!Player::None.launches());
         assert!(Player::Mpv.launches());
     }
 
     #[test]
+    fn a_player_path_replaces_the_binary_but_keeps_the_flags() {
+        let path = Path::new("/tmp/x.sdp");
+        let bin = Path::new("/opt/mpv");
+        let mpv = Player::Mpv.command(path, None, Some(bin));
+        assert_eq!(mpv[0], "/opt/mpv");
+        assert!(mpv.contains(&"--profile=low-latency".to_string()));
+        assert_eq!(mpv.last().unwrap(), "/tmp/x.sdp");
+        // The path is used whatever the player, with that player's flags.
+        let ffplay = Player::Ffplay.command(path, Some(Duration::from_millis(300)), Some(bin));
+        assert_eq!(ffplay[0], "/opt/mpv");
+        assert!(ffplay.contains(&"+discardcorrupt".to_string()));
+    }
+
+    #[test]
     fn a_buffer_switches_the_player_out_of_zero_buffering() {
         let path = Path::new("/tmp/x.sdp");
         let ms = Duration::from_millis(300);
-        let mpv = Player::Mpv.command(path, Some(ms));
+        let mpv = Player::Mpv.command(path, Some(ms), None);
         assert!(!mpv.contains(&"--profile=low-latency".to_string()));
         assert!(!mpv.contains(&"--no-cache".to_string()));
         assert!(mpv.contains(&"--cache=yes".to_string()));
+        assert!(mpv.contains(&"--no-resume-playback".to_string()));
         assert!(mpv.iter().any(|a| a.contains("max_delay=300000")));
 
-        let ffplay = Player::Ffplay.command(path, Some(ms));
+        let ffplay = Player::Ffplay.command(path, Some(ms), None);
         assert!(!ffplay.iter().any(|a| a == "nobuffer"));
         assert!(ffplay.contains(&"+discardcorrupt".to_string()));
         assert!(ffplay.iter().any(|a| a == "300000"));
 
-        let vlc = Player::Vlc.command(path, Some(ms));
+        let vlc = Player::Vlc.command(path, Some(ms), None);
         assert!(vlc.contains(&"--network-caching=300".to_string()));
     }
 
