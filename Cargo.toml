@@ -26,6 +26,11 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 data-encoding = "2.9.0"
 n0-error = "1.0.0"
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 
 [dev-dependencies]
 duct = "1.1.1"

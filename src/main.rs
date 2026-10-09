@@ -4,18 +4,21 @@ mod udp;
 use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
 use clap::{Parser, Subcommand};
-use dumbpipe::EndpointTicket;
+use dumbpipe::{webrtc, EndpointTicket};
 use iroh::{
     endpoint::{presets, Accepting},
     Endpoint, EndpointAddr, SecretKey,
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UdpSocket,
@@ -25,11 +28,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
-#[cfg(unix)]
-use {
-    std::path::PathBuf,
-    tokio::net::{UnixListener, UnixStream},
-};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -124,6 +122,29 @@ pub enum Commands {
     /// listening on a UDP socket for which you have to specify the address.
     ConnectUdp(ConnectUdpArgs),
 
+    /// Listen for a WHIP stream from OBS and forward the media to viewers over
+    /// an iroh connection.
+    ///
+    /// Will print a endpoint ticket on stderr that a viewer can connect with.
+    ///
+    /// As far as the endpoint is concerned, this is listening. But it is also
+    /// serving HTTP, which is where OBS posts its SDP offer. Dumbpipe terminates
+    /// WebRTC (ICE, DTLS, SRTP) here, because neither mpv nor VLC can do it,
+    /// and forwards the media as plain RTP to the viewers.
+    ///
+    /// The media is forwarded unbuffered, one QUIC datagram per RTP packet, and
+    /// a viewer that joins in the middle of a GOP starts at the next keyframe.
+    ListenWhip(ListenWhipArgs),
+
+    /// Connect to a WHIP host and play the stream in a local media player.
+    ///
+    /// A endpoint ticket is required to connect.
+    ///
+    /// As far as the endpoint is concerned, this is connecting. It writes the
+    /// received RTP to local UDP ports and the stream description to an SDP
+    /// file, and launches a player on that file.
+    ConnectWhip(ConnectWhipArgs),
+
     #[cfg(unix)]
     /// Listen on an endpoint and forward incoming connections to the specified
     /// Unix socket path. Every incoming bidi stream is forwarded to a new connection.
@@ -158,6 +179,8 @@ impl Commands {
             Commands::ConnectTcp(args) => Some(&args.common),
             Commands::ListenUdp(args) => Some(&args.common),
             Commands::ConnectUdp(args) => Some(&args.common),
+            Commands::ListenWhip(args) => Some(&args.common),
+            Commands::ConnectWhip(args) => Some(&args.common),
 
             #[cfg(unix)]
             Commands::ListenUnix(args) => Some(&args.common),
@@ -316,6 +339,17 @@ fn udp_alpn(common: &CommonArgs) -> Result<Vec<u8>> {
     })
 }
 
+/// The ALPN to use for a webrtc tunnel.
+///
+/// Unless a custom ALPN is given, the dedicated webrtc ALPN is used, so that a
+/// webrtc viewer can never be mistaken for a stream or udp connector.
+fn webrtc_alpn(common: &CommonArgs) -> Result<Vec<u8>> {
+    Ok(match &common.custom_alpn {
+        Some(alpn) => parse_alpn(alpn)?,
+        None => dumbpipe::WEBRTC_ALPN.to_vec(),
+    })
+}
+
 #[derive(Parser, Debug)]
 pub struct ListenArgs {
     /// Immediately close our sending side, indicating that we will not transmit any data
@@ -376,6 +410,73 @@ pub struct ConnectUdpArgs {
 
     /// The endpoint to connect to
     pub ticket: EndpointTicket,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListenWhipArgs {
+    /// The HTTP address to serve WHIP on.
+    ///
+    /// This is the URL you give OBS in its WHIP output settings, e.g.
+    /// http://127.0.0.1:8080/whip
+    ///
+    /// To accept WHIP from other machines on the local network, use
+    /// 0.0.0.0:8080 and set --ice-addr to the address OBS can reach.
+    #[clap(long, default_value = webrtc::DEFAULT_WHIP_ADDR)]
+    pub listen: String,
+
+    /// The bearer token OBS has to present.
+    ///
+    /// If set, requests without `Authorization: Bearer <token>` are rejected
+    /// with 401. OBS has a field for exactly this token.
+    #[clap(long)]
+    pub bearer_token: Option<String>,
+
+    /// The address to bind the ICE socket on.
+    ///
+    /// By default a loopback `--listen` address gets a loopback ICE socket and
+    /// everything else the address of the interface that routes to the internet.
+    /// Set this explicitly on a machine with several interfaces or a VPN.
+    #[clap(long)]
+    pub ice_addr: Option<SocketAddr>,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ConnectWhipArgs {
+    /// The endpoint to connect to
+    pub ticket: EndpointTicket,
+
+    /// The local address to play the stream out on.
+    ///
+    /// RTP is delivered to the even port of this address, RTCP to the port
+    /// above it, and audio to the next pair, so 5004 needs 5004 to 5007 free.
+    #[clap(long, default_value = webrtc::DEFAULT_PLAY_ADDR)]
+    pub addr: String,
+
+    /// Where to write the SDP file that describes the stream to the player.
+    ///
+    /// Defaults to a file in the system temp directory named after the port.
+    #[clap(long)]
+    pub sdp: Option<PathBuf>,
+
+    /// The media player to launch on the SDP file.
+    ///
+    /// mpv is the default and was verified to work, together with ffplay. VLC
+    /// is offered as an alternative but could not be made to accept a plain RTP
+    /// SDP on the 3.0.x build this was tested with, so use it with care.
+    #[clap(long, value_enum, default_value_t = webrtc::Player::Mpv)]
+    pub player: webrtc::Player,
+
+    /// Do not launch a player, only write the SDP file.
+    ///
+    /// The command line to play the stream yourself is printed instead.
+    #[clap(long)]
+    pub no_launch: bool,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -1084,6 +1185,96 @@ fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
     short.into()
 }
 
+/// Serve WHIP on a local HTTP address and forward the media to viewers.
+///
+/// OBS posts its SDP offer to `http://<listen>/whip`, dumbpipe terminates the
+/// WebRTC session and forwards the media as plain RTP over iroh. Every viewer
+/// that dials in gets the stream from the next keyframe.
+async fn listen_whip(args: ListenWhipArgs) -> Result<()> {
+    let listen = udp::resolve(&args.listen)?;
+    let secret_key = get_or_create_secret()?;
+    let alpn = webrtc_alpn(&args.common)?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![alpn.clone()]).await?;
+    // wait for the endpoint to figure out its address before making a ticket
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+    let addr = endpoint.addr();
+    let short = create_short_ticket(&addr);
+    let ticket = EndpointTicket::new(addr);
+
+    // print the ticket on stderr so it doesn't interfere with the data itself
+    //
+    // note that the tests rely on the ticket being the last thing printed
+    eprintln!("Serving WHIP input on http://{listen}/whip.");
+    eprintln!("Use that as the server URL of the WHIP output in OBS.");
+    eprintln!("To watch the stream, connect with e.g.:");
+    eprintln!("dumbpipe connect-whip {ticket}");
+    if args.common.verbose > 0 {
+        eprintln!("or:\ndumbpipe connect-whip {short}");
+    }
+    tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
+    tracing::debug!(
+        "alpn is {} (hex {})",
+        String::from_utf8_lossy(&alpn),
+        hex::encode(&alpn)
+    );
+
+    let cfg = webrtc::WhipConfig {
+        listen,
+        bearer_token: args.bearer_token.clone(),
+        ice_addr: args.ice_addr,
+        stats: stats_enabled(args.common.verbosity()),
+    };
+    webrtc::listen_whip(endpoint, cfg).await
+}
+
+/// Connect to a WHIP host and play the stream in a local media player.
+async fn connect_whip(args: ConnectWhipArgs) -> Result<()> {
+    let play = udp::resolve(&args.addr)?;
+    let secret_key = get_or_create_secret()?;
+    let endpoint = create_endpoint(secret_key, &args.common, vec![])
+        .await
+        .std_context("unable to bind endpoint")?;
+
+    // Wait for our own endpoint to be ready before trying to connect.
+    if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+
+    let alpn = webrtc_alpn(&args.common)?;
+    let remote_addr = args.ticket.endpoint_addr();
+    tracing::debug!(
+        "dialing {} with alpn {} (hex {})",
+        remote_addr.id,
+        String::from_utf8_lossy(&alpn),
+        hex::encode(&alpn)
+    );
+
+    let cfg = webrtc::ViewerConfig {
+        addr: remote_addr.clone(),
+        alpn,
+        play,
+        sdp: args.sdp.clone(),
+        player: args.player,
+        no_launch: args.no_launch,
+        stats: stats_enabled(args.common.verbosity()),
+    };
+
+    select! {
+        res = webrtc::connect_whip(endpoint.clone(), cfg) => {
+            res?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("got ctrl-c, exiting");
+        }
+    }
+
+    tracing::info!("closing connection to {}", remote_addr.id);
+    endpoint.close().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 /// Listen on an endpoint and forward incoming connections to a Unix socket.
 async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
@@ -1328,6 +1519,8 @@ async fn main() -> Result<()> {
         Commands::ConnectTcp(args) => connect_tcp(args).await,
         Commands::ListenUdp(args) => listen_udp(args).await,
         Commands::ConnectUdp(args) => connect_udp(args).await,
+        Commands::ListenWhip(args) => listen_whip(args).await,
+        Commands::ConnectWhip(args) => connect_whip(args).await,
 
         #[cfg(unix)]
         Commands::ListenUnix(args) => listen_unix(args).await,

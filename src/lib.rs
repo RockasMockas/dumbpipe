@@ -10,4 +10,15 @@ pub const ALPN: &[u8] = b"DUMBPIPEV0";
 /// calls accept_bi() must consume it.
 pub const HANDSHAKE: [u8; 5] = *b"hello";
 
+/// The ALPN used by the webrtc subcommands.
+///
+/// Deliberately different from the stream and udp ALPNs, so that a webrtc
+/// viewer can never be mistaken for a stream or udp connector and vice versa.
+pub const WEBRTC_ALPN: &[u8] = b"DUMBPIPE_WEBRTC_V0";
+
+pub mod rtp;
+pub mod sdp;
+pub mod webrtc;
+pub mod whip;
+
 pub use iroh_tickets::endpoint::EndpointTicket;
