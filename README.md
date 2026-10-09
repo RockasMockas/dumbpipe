@@ -50,6 +50,93 @@ dumbpipe connect endpointealvvv4nwa522qhznqrblv6jxcrgnvpapvakxw5i6mwltmm6ps2r4ai
 - Adjust the ffmpeg options according to your local platform and video capture devices.
 - Use ticket from sender side
 
+## Stream from OBS Studio using WHIP
+
+[OBS Studio](https://obsproject.com/) 30 and newer can output
+[WHIP](https://datatracker.ietf.org/doc/html/draft-murillo-whip) (WebRTC-HTTP
+ingestion protocol). `dumbpipe listen-whip` is the WHIP input: it terminates
+WebRTC (ICE, DTLS, SRTP) on the machine next to OBS, because neither mpv nor
+VLC can do that, and forwards the media over an iroh connection to
+`dumbpipe connect-whip`, which plays it in a local player.
+
+The media is forwarded unbuffered, one QUIC datagram per RTP packet, so the
+latency is that of the network plus the decoder.
+
+### The host, i.e. the machine with OBS
+
+```
+dumbpipe listen-whip --listen 127.0.0.1:8080 --bearer-token secret
+```
+
+This serves the WHIP input on `http://127.0.0.1:8080/whip` and prints a ticket which is what the viewers connect with.
+
+In OBS, under `Settings > Stream`:
+
+- Service: `WHIP`
+- Server: `http://127.0.0.1:8080/whip` (
+- Bearer Token: `secret`, the same as `--bearer-token` (bearer token is optional, can leave empty)
+
+To accept WHIP from another machine on the local network, use
+`--listen 0.0.0.0:8080` and point OBS at the address of that machine.
+
+### The viewer
+
+```
+dumbpipe connect-whip <ticket>
+```
+
+This writes the incoming RTP to local UDP ports, writes an SDP file describing
+the stream, and launches [mpv](https://mpv.io/) on it:
+
+```
+mpv --no-cache --profile=low-latency --force-window=immediate /tmp/dumbpipe-5004.sdp
+```
+
+The player is picked with `--player`:
+
+- `mpv` (default), the `low-latency` profile with no cache
+- `ffplay`, with `-fflags nobuffer` and no analysis delay
+- `vlc`, with `--network-caching=100`
+- `none`, which only writes the SDP file and prints the command to run
+
+Other options:
+
+- `--addr 127.0.0.1:5004` is the base of the local RTP ports. Video takes the
+  even port (5004), its RTCP the port above (5005), audio the next pair
+  (5006/5007). An odd port is rounded up.
+- `--sdp <path>` writes the stream description somewhere else than
+  `/tmp/dumbpipe-<port>.sdp`.
+- `--no-launch` does not start a player, so you can open the SDP file yourself,
+  or point something else at the ports.
+
+### Loss and joining
+
+The tunnel is deliberately dumb: RTP datagrams are not retransmitted, since
+retransmitting late media is worse than losing it.
+
+- A viewer that connects in the middle of a GOP receives nothing until the next
+  keyframe, then everything.
+- A gap in the RTP sequence numbers, and two seconds of silence, both make the
+  viewer ask the host for a keyframe, which the host requests from OBS with a
+  PLI.
+- The host repeats the stream description every second, so a viewer that missed
+  it still knows how to play the stream.
+- Run with `-v` to see the packet counters, and `-vv` to see them every five
+  seconds.
+
+### Caveats
+
+- By default the WHIP input only listens on loopback, so OBS has to run on the
+  same machine as `dumbpipe listen-whip`.
+- On a machine with several interfaces or a VPN, the automatically chosen ICE
+  address may not be the one OBS can reach. Set it with `--ice-addr`.
+- mpv and ffplay were verified end to end against the SDP the viewer writes:
+  both open it, receive the RTP on the local ports and decode it. VLC also
+  parsed the SDP and started its decoder, but failed to create a video output
+  in the headless session this was tested on, so its playback is unverified.
+  If `--player vlc` misbehaves, use `--player none` and play the SDP file
+  yourself.
+
 ## Share a shell for pair- or ensemble programming with [tty-share](https://github.com/elisescu/tty-share):
 
 Sharing a terminal session over the internet is useful for collaboration between programmers, but the public [tty-share](https://github.com/elisescu/tty-share) server isn't very reliable and, more importantly, [it is not end-to-end encrypted](https://tty-share.com/how-it-works/#end-to-end-encryption).
