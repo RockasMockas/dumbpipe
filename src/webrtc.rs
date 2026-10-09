@@ -537,7 +537,7 @@ pub async fn listen_whip(endpoint: Endpoint, cfg: WhipConfig) -> Result<()> {
     let accept = accept_viewers(endpoint.clone(), viewer_tx);
     let host = host_loop(ice, ice_addr, req_rx, viewer_rx, cfg.stats);
 
-    tokio::select! {
+    let result = tokio::select! {
         res = http => res,
         res = accept => res,
         res = host => res,
@@ -545,10 +545,10 @@ pub async fn listen_whip(endpoint: Endpoint, cfg: WhipConfig) -> Result<()> {
             eprintln!("got ctrl-c, exiting");
             Ok(())
         }
-    }?;
+    };
     tracing::info!("stopping whip input");
     endpoint.close().await;
-    Ok(())
+    result
 }
 
 /// Bind the UDP socket that ICE/DTLS/SRTP runs on.

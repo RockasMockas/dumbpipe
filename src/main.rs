@@ -404,7 +404,7 @@ pub struct ConnectUdpArgs {
     ///
     /// Datagrams received here are forwarded to the endpoint in the ticket.
     ///
-    /// To listen on all network interfaces, use 0.0.0.0:9001
+    /// To listen on all network interfaces, use 0.0.0.0:9000
     #[clap(long)]
     pub addr: String,
 
@@ -1038,9 +1038,9 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
     // note that the tests rely on the ticket being the last thing printed
     eprintln!("Forwarding incoming datagrams to udp://{target}.");
     eprintln!("To connect, use e.g.:");
-    eprintln!("dumbpipe connect-udp --addr 127.0.0.1:9001 {ticket}");
+    eprintln!("dumbpipe connect-udp --addr 127.0.0.1:9000 {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-udp --addr 127.0.0.1:9001 {short}");
+        eprintln!("or:\ndumbpipe connect-udp --addr 127.0.0.1:9000 {short}");
     }
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
     tracing::info!(
@@ -1294,18 +1294,19 @@ async fn connect_whip(args: ConnectWhipArgs) -> Result<()> {
         stats: stats_enabled(args.common.verbosity()),
     };
 
-    select! {
+    let result = select! {
         res = webrtc::connect_whip(endpoint.clone(), cfg) => {
-            res?;
+            res
         }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("got ctrl-c, exiting");
+            Ok(())
         }
-    }
+    };
 
     tracing::info!("closing connection to {}", remote_addr.id);
     endpoint.close().await;
-    Ok(())
+    result
 }
 
 #[cfg(unix)]
@@ -1564,7 +1565,9 @@ async fn main() -> Result<()> {
     match res {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("error: {e}");
+            // `Display` prints only the outer error.  Include its sources so
+            // connection failures report Iroh's actionable cause as well.
+            eprintln!("error: {e:#}");
             std::process::exit(1)
         }
     }
