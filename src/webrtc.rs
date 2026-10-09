@@ -108,38 +108,66 @@ pub enum Player {
 
 impl Player {
     /// The command line used to play the SDP file at `sdp`.
-    pub fn command(&self, sdp: &Path) -> Vec<String> {
+    ///
+    /// With `buffer` unset the lowest latency flags are used, which is right on
+    /// a local network. Across a continent the path jitters and reorders packets,
+    /// and a receiver with no buffer drops them, corrupts pictures and loses A/V
+    /// sync; `buffer` then gives the player time to absorb that.
+    pub fn command(&self, sdp: &Path, buffer: Option<Duration>) -> Vec<String> {
         let file = sdp.display().to_string();
         match self {
-            // `--profile=low-latency` turns off buffering and shortens the
-            // probe window, `--no-cache` keeps the demuxer from queueing.
-            Player::Mpv => vec![
-                "mpv".into(),
-                "--no-cache".into(),
-                "--profile=low-latency".into(),
-                "--force-window=immediate".into(),
-                file,
-            ],
-            Player::Vlc => vec![
-                "vlc".into(),
-                "--network-caching=100".into(),
-                "--no-loop".into(),
-                file,
-            ],
-            Player::Ffplay => vec![
-                "ffplay".into(),
-                "-fflags".into(),
-                "nobuffer".into(),
-                "-probesize".into(),
-                "1000000".into(),
-                "-analyzeduration".into(),
-                "0".into(),
-                // The SDP refers to rtp/udp, which lavfi's protocol whitelist
-                // rejects by default.
-                "-protocol_whitelist".into(),
-                "file,rtp,udp,crypto,data".into(),
-                file,
-            ],
+            Player::Mpv => {
+                let mut cmd = vec!["mpv".to_string(), "--force-window=immediate".to_string()];
+                match buffer {
+                    Some(ms) => {
+                        cmd.push("--cache=yes".into());
+                        cmd.push(format!("--demuxer-readahead-secs={}", ms.as_secs_f64()));
+                        // `max_delay` is the RTP demuxer's reorder window in us.
+                        cmd.push(format!("--demuxer-lavf-o=max_delay={}", ms.as_micros()));
+                    }
+                    None => {
+                        cmd.push("--no-cache".into());
+                        cmd.push("--profile=low-latency".into());
+                    }
+                }
+                cmd.push(file);
+                cmd
+            }
+            Player::Vlc => {
+                let caching = buffer.map(|d| d.as_millis()).unwrap_or(100);
+                vec![
+                    "vlc".into(),
+                    format!("--network-caching={caching}"),
+                    "--no-loop".into(),
+                    file,
+                ]
+            }
+            Player::Ffplay => {
+                let mut cmd = vec!["ffplay".to_string()];
+                match buffer {
+                    Some(ms) => {
+                        // Drop corrupt packets instead of feeding them to the
+                        // decoder, and let the RTP receiver wait for reordering.
+                        cmd.extend(["-fflags".into(), "+discardcorrupt".into()]);
+                        cmd.extend(["-max_delay".into(), ms.as_micros().to_string()]);
+                    }
+                    None => {
+                        cmd.extend(["-fflags".into(), "nobuffer".into()]);
+                    }
+                }
+                cmd.extend([
+                    "-probesize".into(),
+                    "1000000".into(),
+                    "-analyzeduration".into(),
+                    "0".into(),
+                    // The SDP refers to rtp/udp, which lavfi's protocol whitelist
+                    // rejects by default.
+                    "-protocol_whitelist".into(),
+                    "file,rtp,udp,crypto,data".into(),
+                ]);
+                cmd.push(file);
+                cmd
+            }
             Player::None => vec![file],
         }
     }
@@ -1308,6 +1336,8 @@ pub struct ViewerConfig {
     pub player: Player,
     /// Whether to launch the player at all.
     pub no_launch: bool,
+    /// How much jitter buffer to give the player, `None` for lowest latency.
+    pub buffer: Option<Duration>,
     /// Whether to log periodic counters.
     pub stats: bool,
 }
@@ -1542,11 +1572,11 @@ async fn launch(
     if cfg.no_launch || !cfg.player.launches() {
         tracing::info!(
             "not launching a player, play with: {}",
-            cfg.player.command(sdp_path).join(" ")
+            cfg.player.command(sdp_path, cfg.buffer).join(" ")
         );
         return Ok(None);
     }
-    let command = cfg.player.command(sdp_path);
+    let command = cfg.player.command(sdp_path, cfg.buffer);
     let mut child = Command::new(&command[0])
         .args(&command[1..])
         .spawn()
@@ -1884,18 +1914,37 @@ mod tests {
     #[test]
     fn player_commands_are_low_latency() {
         let path = Path::new("/tmp/x.sdp");
-        let mpv = Player::Mpv.command(path);
+        let mpv = Player::Mpv.command(path, None);
         assert_eq!(mpv[0], "mpv");
         assert!(mpv.contains(&"--profile=low-latency".to_string()));
         assert_eq!(mpv.last().unwrap(), "/tmp/x.sdp");
         assert!(Player::Vlc
-            .command(path)
+            .command(path, None)
             .contains(&"--network-caching=100".to_string()));
         assert!(Player::Ffplay
-            .command(path)
+            .command(path, None)
             .contains(&"nobuffer".to_string()));
         assert!(!Player::None.launches());
         assert!(Player::Mpv.launches());
+    }
+
+    #[test]
+    fn a_buffer_switches_the_player_out_of_zero_buffering() {
+        let path = Path::new("/tmp/x.sdp");
+        let ms = Duration::from_millis(300);
+        let mpv = Player::Mpv.command(path, Some(ms));
+        assert!(!mpv.contains(&"--profile=low-latency".to_string()));
+        assert!(!mpv.contains(&"--no-cache".to_string()));
+        assert!(mpv.contains(&"--cache=yes".to_string()));
+        assert!(mpv.iter().any(|a| a.contains("max_delay=300000")));
+
+        let ffplay = Player::Ffplay.command(path, Some(ms));
+        assert!(!ffplay.iter().any(|a| a == "nobuffer"));
+        assert!(ffplay.contains(&"+discardcorrupt".to_string()));
+        assert!(ffplay.iter().any(|a| a == "300000"));
+
+        let vlc = Player::Vlc.command(path, Some(ms));
+        assert!(vlc.contains(&"--network-caching=300".to_string()));
     }
 
     #[test]

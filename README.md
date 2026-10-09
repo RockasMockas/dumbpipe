@@ -108,6 +108,39 @@ Other options:
   `/tmp/dumbpipe-<port>.sdp`.
 - `--no-launch` does not start a player, so you can open the SDP file yourself,
   or point something else at the ports.
+- `--buffer <ms>` gives the player a jitter buffer. The default is the lowest
+  latency, which is right on a local network. See the next section for when you
+  need it.
+
+### Streaming across a long distance
+
+On a LAN the zero-buffer settings are ideal. Across a country or an ocean the
+path adds latency, jitter and packet loss, and a receiver with no buffer cannot
+absorb it: the RTP receiver gives up waiting for reordered packets
+(`max delay reached. need to consume packet`), decodes incomplete pictures
+(`corrupted macroblock`, `error while decoding MB`) and audio drifts out of
+sync (`Invalid audio PTS`, `Audio/Video desynchronisation`). That is not a
+dumbpipe bug, it is the buffer being too small for the path.
+
+Trade latency for stability:
+
+```
+dumbpipe connect-whip --buffer 300 <ticket>
+```
+
+- Start at `--buffer 300` (or `500` if it still breaks). This sets the player's
+  read-ahead and the RTP reorder window, so late and reordered packets are
+  caught instead of dropped.
+- On the OBS side, shorten the keyframe interval to 1 second and keep the
+  packet size at ~1200 bytes or lower. A short keyframe interval means a lost
+  burst recovers quickly; small packets avoid fragmentation on a smaller path
+  MTU, which is what turns into the huge `missed N packets` counts.
+- Lower the bitrate if loss persists: less data means fewer datagrams on the
+  wire and a lower chance of loss and of oversized datagrams being dropped.
+
+You cannot have LAN-grade latency and clean playback on a lossy intercontinental
+link at the same time. `--buffer` is the dial between them: `0`/unset for a
+local stream, a few hundred milliseconds for a long-haul one.
 
 ### Loss and joining
 

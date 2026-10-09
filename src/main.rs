@@ -478,6 +478,16 @@ pub struct ConnectWhipArgs {
     #[clap(long)]
     pub no_launch: bool,
 
+    /// How much jitter buffer to give the player, in milliseconds.
+    ///
+    /// The default is the lowest latency, which is right on a local network.
+    /// Across a country or an ocean the path jitters, reorders and drops
+    /// packets, and a receiver with no buffer drops them too: you get decode
+    /// errors and audio that drifts out of sync. Set this to 200-500 for a
+    /// long-distance link and the player will absorb the jitter instead.
+    #[clap(long)]
+    pub buffer: Option<u64>,
+
     #[clap(flatten)]
     pub common: CommonArgs,
 }
@@ -1258,6 +1268,7 @@ async fn connect_whip(args: ConnectWhipArgs) -> Result<()> {
         sdp: args.sdp.clone(),
         player: args.player,
         no_launch: args.no_launch,
+        buffer: args.buffer.map(Duration::from_millis),
         stats: stats_enabled(args.common.verbosity()),
     };
 
