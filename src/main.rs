@@ -13,7 +13,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use dumbpipe::{webrtc, EndpointTicket};
 use iroh::{
-    endpoint::{presets, Accepting},
+    endpoint::{presets, Accepting, QuicTransportConfig},
     Endpoint, EndpointAddr, SecretKey,
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
@@ -661,7 +661,18 @@ fn get_or_create_secret() -> Result<SecretKey> {
     }
 }
 
-/// Create a new iroh endpoint.
+/// QUIC datagram buffers for the media path.
+const DATAGRAM_BUFFER: usize = 8 * 1024 * 1024;
+
+/// The QUIC transport config for a media tunnel: default state machine, but with
+/// the datagram buffers widened for high bitrate. See [`DATAGRAM_BUFFER`].
+fn media_transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
+        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .build()
+}
+
 async fn create_endpoint(
     secret_key: SecretKey,
     common: &CommonArgs,
@@ -679,7 +690,8 @@ async fn create_endpoint(
     }
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(alpns);
+        .alpns(alpns)
+        .transport_config(media_transport_config());
     if let Some(addr) = common.ipv4_addr {
         tracing::debug!("binding ipv4 addr {addr}");
         builder = builder.bind_addr(addr)?;
