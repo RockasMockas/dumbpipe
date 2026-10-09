@@ -59,7 +59,7 @@ use tokio::{
 use crate::{
     rtp::{
         self, Codec, ParameterSets, Reorder, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_FRAGMENT,
-        TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO,
+        TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO, reorder_timeout_for,
     },
     sdp::{self, MediaHeader, MediaKind, OfferMedia, SessionHeader},
     whip::{self, Answer, WhipRequest},
@@ -1537,9 +1537,13 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
         // QUIC datagrams are unordered, so put each media back into RTP
         // sequence order before the player sees it; otherwise ffplay reads the
         // reordering as loss and corrupts the picture. Video and audio have
-        // separate sequence spaces, so each gets its own buffer.
-        let mut video_order = Reorder::default();
-        let mut audio_order = Reorder::default();
+        // separate sequence spaces, so each gets its own buffer. The reorder
+        // window is sized from `--buffer` so the two reorder stages stay in
+        // tandem: a bigger player buffer lets us wait a little longer for a
+        // reordered packet, but never long enough to stall on a lost one.
+        let reorder_timeout = reorder_timeout_for(cfg.buffer);
+        let mut video_order = Reorder::with_timeout(reorder_timeout);
+        let mut audio_order = Reorder::with_timeout(reorder_timeout);
         let mut last_packet = tokio::time::Instant::now();
         let mut wait_tick = interval(WAIT_INTERVAL);
         wait_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);

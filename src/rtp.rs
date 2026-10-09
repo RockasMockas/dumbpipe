@@ -189,14 +189,42 @@ impl Reassembler {
     }
 }
 
-/// How long the [`Reorder`] holds a packet waiting for a missing earlier one.
+/// The default how long a [`Reorder`] holds a packet waiting for a missing
+/// earlier one, used when the viewer runs with no player buffer.
 ///
 /// QUIC datagrams are unordered, so the viewer must put RTP packets back in
 /// sequence order for the player. This is how long it waits for a hole to be
 /// filled by a late packet before flushing what it has and letting the player
 /// conceal the gap. Long enough to cover typical reordering, short enough that
 /// the stream never visibly stalls.
+///
+/// When the user asks for a player buffer (`--buffer`) the viewer derives a
+/// longer window from it instead, via [`Reorder::with_timeout`], so the two
+/// reorder stages move in tandem. See [`reorder_timeout_for`].
 const REORDER_TIMEOUT: Duration = Duration::from_millis(80);
+
+/// Floor and ceiling for the reorder window derived from a player buffer.
+///
+/// The window is a fraction of the buffer (see [`reorder_timeout_for`]), kept
+/// within these bounds: never below what covers ordinary reordering, never so
+/// long that we sit on holes that are really lost packets.
+const REORDER_TIMEOUT_MIN: Duration = Duration::from_millis(40);
+const REORDER_TIMEOUT_MAX: Duration = Duration::from_millis(150);
+
+/// Derive the viewer's reorder window from the player buffer.
+///
+/// `--buffer` is the player's total jitter/reorder budget; our [`Reorder`] is
+/// the small, fast stage in front of it. We take a quarter of the buffer,
+/// clamped to [`REORDER_TIMEOUT_MIN`]..=[`REORDER_TIMEOUT_MAX`], so a bigger
+/// buffer nudges us toward catching worse long-distance reordering without
+/// turning the reorder stage into a latency trap (a hole unfilled after ~150 ms
+/// is a lost QUIC datagram, not a reordered one). `None` (no buffer, lowest
+/// latency) keeps the default [`REORDER_TIMEOUT`].
+pub fn reorder_timeout_for(buffer: Option<Duration>) -> Duration {
+    buffer
+        .map(|b| (b / 4).clamp(REORDER_TIMEOUT_MIN, REORDER_TIMEOUT_MAX))
+        .unwrap_or(REORDER_TIMEOUT)
+}
 
 /// The most packets the [`Reorder`] holds per media at once.
 ///
@@ -216,19 +244,42 @@ const REORDER_CAP: usize = 256;
 ///
 /// A packet that arrives exactly when expected is emitted at once; a later one
 /// is held until the hole before it is filled. If a hole is not filled within
-/// [`REORDER_TIMEOUT`], everything held is flushed in sequence order and the hole
-/// is abandoned: the missing packet is genuine loss, which the player conceals.
-/// Packets older than the next expected (very late, or duplicates past a hole)
-/// are dropped.
-#[derive(Default)]
+/// the configured timeout ([`Reorder::default`]'s [`REORDER_TIMEOUT`], or a
+/// longer window from [`Reorder::with_timeout`]), everything held is flushed in
+/// sequence order and the hole is abandoned: the missing packet is genuine loss,
+/// which the player conceals. Packets older than the next expected (very late,
+/// or duplicates past a hole) are dropped.
 pub struct Reorder {
     /// The next sequence number to emit, `None` until the first packet.
     next: Option<u16>,
     /// Held packets, `(seq, arrival, packet)`, out of order.
     held: Vec<(u16, Instant, Vec<u8>)>,
+    /// How long to hold a hole before flushing. See [`Reorder::with_timeout`].
+    timeout: Duration,
+}
+
+impl Default for Reorder {
+    fn default() -> Self {
+        Self {
+            next: None,
+            held: Vec::new(),
+            timeout: REORDER_TIMEOUT,
+        }
+    }
 }
 
 impl Reorder {
+    /// A reorder that waits `timeout` for a hole before flushing.
+    ///
+    /// Use [`reorder_timeout_for`] to size this from the player's `--buffer` so
+    /// the two reorder stages stay in tandem.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Default::default()
+        }
+    }
+
     /// Feed one packet by its RTP sequence number.
     ///
     /// Returns the packets to hand to the player now, in sequence order: the
@@ -295,7 +346,7 @@ impl Reorder {
             .iter()
             .map(|(_, at, _)| now.duration_since(*at))
             .max()
-            .is_some_and(|wait| wait >= REORDER_TIMEOUT)
+            .is_some_and(|wait| wait >= self.timeout)
         {
             self.flush(out);
         }
@@ -913,5 +964,45 @@ mod tests {
         // after an epoch the baseline is gone: a new low sequence number is the
         // start of a fresh GOP, not a late packet to drop.
         assert_eq!(r.push(1, vec![1], now), vec![vec![1]]);
+    }
+
+    #[test]
+    fn reorder_timeout_tracks_the_player_buffer() {
+        // No buffer (lowest latency): the default window.
+        assert_eq!(reorder_timeout_for(None), REORDER_TIMEOUT);
+        // A quarter of the buffer, clamped to the floor and ceiling.
+        assert_eq!(
+            reorder_timeout_for(Some(Duration::from_millis(200))),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            reorder_timeout_for(Some(Duration::from_millis(500))),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            reorder_timeout_for(Some(Duration::from_millis(1000))),
+            REORDER_TIMEOUT_MAX,
+            "capped so we never sit on lost packets"
+        );
+        assert_eq!(
+            reorder_timeout_for(Some(Duration::from_millis(40))),
+            REORDER_TIMEOUT_MIN,
+            "floored to cover ordinary reordering"
+        );
+    }
+
+    #[test]
+    fn reorder_honours_a_custom_timeout() {
+        let mut r = Reorder::with_timeout(Duration::from_millis(200));
+        let t0 = Instant::now();
+        assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
+        assert!(r.push(3, vec![3], t0).is_empty());
+        // still held at 80ms: the default window would have flushed by now.
+        assert!(r.push(4, vec![4], t0 + Duration::from_millis(80)).is_empty());
+        // flushed once past the longer, custom window.
+        assert_eq!(
+            r.push(5, vec![5], t0 + Duration::from_millis(200)),
+            vec![vec![3], vec![4], vec![5]]
+        );
     }
 }
