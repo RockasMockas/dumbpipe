@@ -1581,15 +1581,22 @@ async fn wait_until_listening(port: u16) {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let started = Instant::now();
     while started.elapsed() < PLAYER_READY_TIMEOUT {
-        match UdpSocket::bind(addr).await {
-            // Still free, the player has not bound it yet.
-            Ok(_) => sleep(Duration::from_millis(50)).await,
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => return,
+        // Probe by binding the port, but drop the probe socket before we sleep.
+        // A socket bound in a `match` scrutinee lives until the end of the whole
+        // `match`, so binding and then sleeping inside the arm would hog the very
+        // port the player is trying to bind and make it fail to open it.
+        let free = match UdpSocket::bind(addr).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => false,
             Err(e) => {
                 tracing::debug!("cannot probe the player port: {e}");
                 return;
             }
+        };
+        if !free {
+            return;
         }
+        sleep(Duration::from_millis(50)).await;
     }
     tracing::warn!("the player did not open udp://{port}, forwarding anyway");
 }
@@ -2270,5 +2277,35 @@ mod tests {
         assert_eq!(h.seen, vec![MediaKind::Video]);
         h.log_streaming(MediaKind::Audio, &video, false);
         assert_eq!(h.seen, vec![MediaKind::Video, MediaKind::Audio]);
+    }
+
+    #[tokio::test]
+    async fn wait_until_listening_does_not_hog_the_port() {
+        // Regression: the probe used to hold the RTP port across its sleep, so
+        // the player it was waiting for could never bind it. The port must stay
+        // bindable by the player while we wait, and the wait must end once the
+        // player has it.
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let wait = tokio::spawn(wait_until_listening(port));
+
+        let mut player = None;
+        for _ in 0..40 {
+            match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await {
+                Ok(socket) => {
+                    player = Some(socket);
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let _player = player.expect("the player never got the port it was waiting for");
+
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("wait_until_listening did not return after the player bound")
+            .unwrap();
     }
 }
