@@ -82,11 +82,13 @@ const PLAYER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL_INTERVAL: Duration = Duration::from_secs(2);
 /// The shortest interval between two keyframe requests from one viewer.
 ///
-/// On a lossy long-distance path almost every frame has a gap, and answering
-/// every gap with a PLI makes the encoder produce IDR after IDR, which blows
-/// up the bitrate and drops even more packets. One recovery per second is
-/// plenty.
-const KF_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+/// A gap in the stream nudges the encoder to refresh, but `last_keyframe` is
+/// refreshed by every keyframe that arrives, so a gap right after an IDR asks
+/// for nothing: only a sustained gap with no keyframe for this whole interval
+/// sends a PLI. Without that, on a lossy path nearly every frame has a gap and
+/// a PLI per gap makes the encoder produce IDR after IDR, which blows up the
+/// bitrate and drops even more packets.
+const KF_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 /// A path with at least this round-trip time counts as long-distance and gets
 /// an automatic jitter buffer for the player.
 const WAN_RTT: Duration = Duration::from_millis(50);
@@ -906,11 +908,16 @@ impl Host {
                 self.request_keyframe();
             }
             ViewerEvent::Keyframe { id } => {
-                // The viewer is about to start, or lost packets: close the gate
-                // again and reopen it at the next keyframe.
-                if let Some(viewer) = self.viewers.iter_mut().find(|v| v.id == id) {
-                    viewer.streaming = false;
-                }
+                // A viewer asks for a keyframe when it starts its player, when
+                // media stalls, or when it sees a gap. If the viewer is already
+                // streaming it has its SDP and parameter sets, so we must NOT
+                // close the gate: on a lossy path nearly every frame has a gap,
+                // and closing the gate on each one drops the whole stream until
+                // the next IDR, which the player reports as thousands of missed
+                // packets, jumping timestamps and a blackout between keyframes.
+                // Keep forwarding and just nudge the encoder to refresh; the
+                // player's jitter buffer and error concealment ride out the loss.
+                let _ = id;
                 self.request_keyframe();
             }
             ViewerEvent::Left { id } => {
@@ -1116,6 +1123,12 @@ impl Host {
                     &viewer.tx,
                     &Frame::Header(Bytes::from(self.header.encode())),
                 );
+            }
+            // Tag every keyframe with an epoch, not just the one that opens the
+            // gate: the viewer uses it to reset its sequence baseline (so an IDR
+            // does not look like a gap) and to pace its keyframe requests, which
+            // keeps a lossy path from poking the encoder with a PLI per frame.
+            if keyframe {
                 try_send(&viewer.tx, &Frame::Epoch);
             }
             try_send(&viewer.tx, &frame);
@@ -1575,6 +1588,10 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                             if header.as_ref().is_some_and(|h| h.has_media()) {
                                 forwarding = true;
                                 last_seq = None;
+                                // A keyframe just arrived: it is the newest decoder
+                                // refresh, so a gap right after it is not a loss and
+                                // we must not poke the encoder because of it.
+                                last_kf = Some(Instant::now());
                                 // fragments of the old GOP are dead now
                                 reassembler.clear();
                                 tracing::info!("streaming from a keyframe");
@@ -1785,10 +1802,12 @@ async fn wait_until_listening(port: u16) {
 
 /// Forward one RTP packet to the local player port.
 ///
-/// A gap in the video sequence makes the viewer ask the host for a keyframe,
-/// but at most once per [`KF_REQUEST_INTERVAL`]: on a lossy path nearly every
-/// frame has a gap, and a PLI per gap turns into a keyframe storm that
-/// amplifies the loss instead of recovering from it.
+/// A gap in the video sequence nudges the viewer to ask the host for a
+/// keyframe, but `last_kf` is refreshed by every keyframe that arrives (the
+/// host tags each one with an epoch), so a gap right after an IDR asks for
+/// nothing. Only a sustained gap with no keyframe for [`KF_REQUEST_INTERVAL`]
+/// sends a PLI: on a lossy path nearly every frame has a gap, and a PLI per gap
+/// turns into a keyframe storm that amplifies the loss instead of recovering.
 async fn forward(
     socket: &Arc<UdpSocket>,
     packet: &[u8],
@@ -1998,7 +2017,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyframe_request_recloses_the_gate() {
+    async fn keyframe_request_keeps_the_stream_flowing() {
+        // Once a viewer is streaming it has its SDP and parameter sets, so a
+        // keyframe request (a gap on a lossy path) must NOT blackout the stream:
+        // the gate stays open, inter frames keep flowing, and every keyframe is
+        // epoch-tagged so the viewer can pace its requests.
         let mut host = host().await;
         host.negotiate(&offer(), false).expect("an answer");
         let mut rx = viewer(&mut host);
@@ -2009,12 +2032,18 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Frame::Epoch)));
         assert!(matches!(rx.try_recv(), Ok(Frame::Video(_))));
 
+        // A gap nudges the encoder, but the gate stays open: the next inter
+        // frame is still forwarded, no blackout until the next IDR.
         host.on_viewer_event(ViewerEvent::Keyframe { id: 1 });
         host.handle_media(info(96, 2), &nal(1, b"inter"));
-        assert!(rx.try_recv().is_err(), "the gate is closed again");
+        assert!(
+            matches!(rx.try_recv(), Ok(Frame::Video(_))),
+            "the gate stays open after a keyframe request"
+        );
 
+        // The next keyframe is epoch-tagged (no header, the viewer has it) so
+        // the viewer resets its sequence baseline there.
         host.handle_media(info(96, 3), &keyframe());
-        assert!(matches!(rx.try_recv(), Ok(Frame::Header(_))));
         assert!(matches!(rx.try_recv(), Ok(Frame::Epoch)));
         assert!(matches!(rx.try_recv(), Ok(Frame::Video(_))));
     }
