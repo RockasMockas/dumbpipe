@@ -1332,6 +1332,9 @@ pub struct ViewerConfig {
     pub play: SocketAddr,
     /// Where to write the SDP file.
     pub sdp: Option<std::path::PathBuf>,
+    /// Whether to write the default SDP file into the current folder rather than
+    /// the system temp dir. Set for `--player none` and a bare `--sdp`.
+    pub sdp_here: bool,
     /// The player to launch.
     pub player: Player,
     /// Whether to launch the player at all.
@@ -1390,10 +1393,10 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             cfg.play
         );
     }
-    let sdp_path = cfg
-        .sdp
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("dumbpipe-{}.sdp", ports.video)));
+    // An explicit `--sdp=path` wins; a bare `--sdp` or `--player none` drops
+    // the default-named file in the current folder for the user to open; a
+    // launched player keeps it in the temp dir.
+    let sdp_path = sdp_path(cfg.sdp.clone(), cfg.sdp_here, ports.video);
     tracing::info!("writing the player description to {}", sdp_path.display());
 
     let video = Arc::new(
@@ -1550,6 +1553,29 @@ fn media_signature(header: &SessionHeader) -> String {
         .join(",")
 }
 
+/// Where the SDP file goes.
+///
+/// An explicit path wins; a directory gets the default name inside it. With no
+/// usable path, `here` drops the file in the current folder so the user can
+/// open it by hand (`--player none`, or a bare `--sdp`); otherwise it goes to
+/// the system temp dir to keep the folder clean.
+fn sdp_path(
+    explicit: Option<std::path::PathBuf>,
+    here: bool,
+    video_port: u16,
+) -> std::path::PathBuf {
+    let name = format!("dumbpipe-{video_port}.sdp");
+    if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+        return if p.is_dir() { p.join(name) } else { p };
+    }
+    let dir = if here {
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(name)
+}
+
 /// Write the SDP file.
 async fn write_sdp(path: &std::path::Path, sdp: &str) -> Result<()> {
     tokio::fs::write(path, sdp)
@@ -1569,7 +1595,15 @@ async fn launch(
     kf_tx: &mpsc::Sender<()>,
     exit_tx: &mpsc::Sender<()>,
 ) -> Result<Option<PlayerHandle>> {
-    if cfg.no_launch || !cfg.player.launches() {
+    if !cfg.player.launches() {
+        // No player at all: tell the operator exactly where the file is and how
+        // to open it, since we are leaving the watching to them.
+        let path = sdp_path.display();
+        eprintln!("saved the stream description to {path}");
+        eprintln!("open it in a player to watch, e.g. 'mpv {path}' or 'vlc {path}'");
+        return Ok(None);
+    }
+    if cfg.no_launch {
         tracing::info!(
             "not launching a player, play with: {}",
             cfg.player.command(sdp_path, cfg.buffer).join(" ")
@@ -1945,6 +1979,24 @@ mod tests {
 
         let vlc = Player::Vlc.command(path, Some(ms));
         assert!(vlc.contains(&"--network-caching=300".to_string()));
+    }
+
+    #[test]
+    fn sdp_path_honours_explicit_here_and_default() {
+        // A named file wins as-is.
+        let named = sdp_path(Some("/tmp/mine.sdp".into()), false, 5004);
+        assert_eq!(named, std::path::Path::new("/tmp/mine.sdp"));
+        // A bare `--sdp`, or no player, drops the default name in the cwd.
+        let here = sdp_path(None, true, 5004);
+        assert!(here.starts_with(std::env::current_dir().unwrap()));
+        assert_eq!(
+            here.file_name().unwrap().to_str().unwrap(),
+            "dumbpipe-5004.sdp"
+        );
+        // A launched player with no path keeps it in the temp dir.
+        let tmp = sdp_path(None, false, 5004);
+        assert!(tmp.starts_with(std::env::temp_dir()));
+        assert!(!tmp.starts_with(std::env::current_dir().unwrap()));
     }
 
     #[test]

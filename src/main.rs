@@ -460,9 +460,12 @@ pub struct ConnectWhipArgs {
 
     /// Where to write the SDP file that describes the stream to the player.
     ///
-    /// Defaults to a file in the system temp directory named after the port.
-    #[clap(long)]
-    pub sdp: Option<PathBuf>,
+    /// The value is optional: `--sdp` on its own writes the default file
+    /// (`dumbpipe-<port>.sdp`) into the current folder, so you can open it by
+    /// hand. Give a path with an equals sign, `--sdp=/tmp/mine.sdp`, to choose
+    /// the name, or a directory to put the default file inside it.
+    #[clap(long, num_args(0..=1), require_equals(true))]
+    pub sdp: Option<Option<PathBuf>>,
 
     /// The media player to launch on the SDP file.
     ///
@@ -1261,11 +1264,20 @@ async fn connect_whip(args: ConnectWhipArgs) -> Result<()> {
         hex::encode(&alpn)
     );
 
+    // `--sdp=path` wins; a bare `--sdp`, or `--player none`, drops the
+    // default-named file in the current folder for the user to open.
+    let (sdp, sdp_here) = match args.sdp.clone() {
+        Some(Some(p)) => (Some(p), false),
+        Some(None) => (None, true),
+        None => (None, args.player == webrtc::Player::None),
+    };
+
     let cfg = webrtc::ViewerConfig {
         addr: remote_addr.clone(),
         alpn,
         play,
-        sdp: args.sdp.clone(),
+        sdp,
+        sdp_here,
         player: args.player,
         no_launch: args.no_launch,
         buffer: args.buffer.map(Duration::from_millis),
