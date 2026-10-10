@@ -99,6 +99,13 @@ pub struct SharedState {
     pub(crate) stats: Option<StreamStats>,
     /// The current broadcast ticket, shown after the endpoint is online.
     pub(crate) ticket: Option<String>,
+    /// Whether a ticket refresh is in flight (rebinding the endpoint to pick up a
+    /// fresh relay / socket and mint a new ticket). Disables the refresh button so a
+    /// double click cannot rebind twice.
+    pub(crate) refreshing: bool,
+    /// A one-shot completion notice for the UI (e.g. "Relay refreshed ✓"), set by a
+    /// finished refresh/reset task and taken by the draw loop to raise a toast.
+    pub(crate) notice: Option<String>,
     /// The WHIP URL to give OBS, tracking the configured host and port.
     whip_url: String,
     /// The last error surfaced to the UI.
@@ -116,6 +123,8 @@ impl SharedState {
             mode: Mode::Idle,
             stats: None,
             ticket: None,
+            refreshing: false,
+            notice: None,
             whip_url,
             error: None,
         }
@@ -296,6 +305,112 @@ pub fn spawn_broadcast(
         }
         ctx.request_repaint();
     })
+}
+
+/// Bring an online endpoint's live address into a ticket, store it as the current
+/// ticket, clear `refreshing`, and raise `done_msg` as a completion notice.
+///
+/// Shared by the relay-refresh and ticket-reset tasks: both rebind and then need the
+/// identical "wait online, mint, publish" tail.
+async fn mint_and_publish(
+    state: &Arc<Mutex<SharedState>>,
+    endpoint: &Endpoint,
+    ctx: &egui::Context,
+    done_msg: &'static str,
+) {
+    if timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
+        tracing::warn!("failed to connect to the home relay");
+    }
+    let shown = EndpointTicket::new(endpoint.addr()).to_string();
+    tracing::debug!("fresh ticket: {shown}");
+    let mut g = state.lock().unwrap();
+    g.refreshing = false;
+    g.ticket = Some(shown);
+    g.notice = Some(done_msg.to_string());
+    drop(g);
+    ctx.request_repaint();
+}
+
+/// Refresh the saved broadcast ticket without starting a session.
+///
+/// Drops the cached endpoint so the refresh rebinds and picks up a fresh relay /
+/// socket, then mints a new ticket from the live endpoint address (exactly like the
+/// start path) and stores it as the current ticket. The endpoint identity is unchanged
+/// (same secret), so previously shared tickets still resolve. The UI persists it to
+/// `config.broadcast_ticket`, so it is the ticket shown until the next broadcast mints
+/// its own. Only offered while idle, so a refresh can never rebind the endpoint out
+/// from under a running stream.
+pub fn spawn_refresh_ticket(
+    state: Arc<Mutex<SharedState>>,
+    handle: Handle,
+    ctx: egui::Context,
+    bind: BindAddrs,
+    done_msg: &'static str,
+) {
+    {
+        let mut g = state.lock().unwrap();
+        g.refreshing = true;
+        g.error = None;
+        g.notice = None;
+        // Drop the cached endpoint so `ensure_endpoint` rebinds rather than handing
+        // back the old socket — that rebind is what yields a new relay and a new
+        // ticket when addresses are ephemeral.
+        g.endpoint = None;
+    }
+    ctx.request_repaint();
+    handle.spawn(async move {
+        let endpoint = match ensure_endpoint(&state, bind).await {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                let mut g = state.lock().unwrap();
+                g.refreshing = false;
+                g.error = Some(format!("could not bind endpoint: {e:#}"));
+                drop(g);
+                ctx.request_repaint();
+                return;
+            }
+        };
+        mint_and_publish(&state, &endpoint, &ctx, done_msg).await;
+    });
+}
+
+/// Reset the broadcast identity to a brand-new keypair and mint a fresh ticket.
+///
+/// Like [`spawn_refresh_ticket`] but installs `secret` as the endpoint's identity
+/// first, so the rebind produces a new endpoint id and a ticket that shares nothing
+/// with any previously issued one. The caller persists the new secret to
+/// `config.secret_hex`. Only offered while idle.
+pub fn spawn_reset_ticket(
+    state: Arc<Mutex<SharedState>>,
+    handle: Handle,
+    ctx: egui::Context,
+    secret: SecretKey,
+    bind: BindAddrs,
+    done_msg: &'static str,
+) {
+    {
+        let mut g = state.lock().unwrap();
+        g.refreshing = true;
+        g.error = None;
+        g.notice = None;
+        g.secret = secret;
+        g.endpoint = None;
+    }
+    ctx.request_repaint();
+    handle.spawn(async move {
+        let endpoint = match ensure_endpoint(&state, bind).await {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                let mut g = state.lock().unwrap();
+                g.refreshing = false;
+                g.error = Some(format!("could not bind endpoint: {e:#}"));
+                drop(g);
+                ctx.request_repaint();
+                return;
+            }
+        };
+        mint_and_publish(&state, &endpoint, &ctx, done_msg).await;
+    });
 }
 
 /// The parameters needed to start watching a stream.

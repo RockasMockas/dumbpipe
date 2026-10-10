@@ -7,6 +7,7 @@ use std::{
 };
 
 use eframe::egui::{self, Context, Ui};
+use iroh::SecretKey;
 
 use super::{
     config::Config,
@@ -171,15 +172,20 @@ impl App {
             ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
         }
 
-        // Once live, reveal the two click-to-copy boxes and the statistics.
+        // Once live, reveal the two click-to-copy boxes and the statistics. While
+        // idle, still surface the saved ticket so it can be copied and refreshed for
+        // the next broadcast — but never offer a refresh live, since rebinding the
+        // endpoint mid-stream would tear down the running session.
         if broadcasting {
             ui.add_space(12.0);
             ui.strong("Give OBS this WHIP server URL:");
-            self.copy_box(ui, "whip", &snap.whip_url);
+            let w = ui.available_width();
+            self.copy_box(ui, "whip", &snap.whip_url, w);
             ui.add_space(6.0);
             ui.strong("Send friends this ticket to watch:");
             let ticket = snap.ticket.clone().unwrap_or_else(|| "…".into());
-            self.copy_box(ui, "ticket", &ticket);
+            let w = ui.available_width();
+            self.copy_box(ui, "ticket", &ticket, w);
 
             // Remember the ticket we are actually showing, so the most recent
             // broadcast survives restarts (for reference / history). This is *not*
@@ -199,15 +205,114 @@ impl App {
 
             ui.add_space(12.0);
             self.stats_panel(ui, &snap);
+        } else {
+            ui.add_space(12.0);
+            ui.strong("Send friends this ticket to watch:");
+            let ticket = snap
+                .ticket
+                .clone()
+                .or_else(|| self.config.broadcast_ticket.clone())
+                .unwrap_or_else(|| "no ticket yet — press Refresh Relay".into());
+            let requested =
+                self.ticket_row(ui, "ticket", &ticket, !active, "Refresh Relay", "Refreshing…");
+            if requested {
+                self.refresh_relay(ui.ctx());
+            }
         }
     }
 
+    /// A ticket copy box with an optional trailing button on its right edge.
+    ///
+    /// When `allow` is false the row is just the full-width copy box (used while
+    /// broadcasting, where a live rebind would tear down the running session). The
+    /// button shows `label`, or `busy_label` while a rebind is already in flight, and
+    /// is disabled meanwhile. Returns `true` on the frame the button is clicked, so the
+    /// caller dispatches the action (relay refresh vs. full ticket reset).
+    pub(crate) fn ticket_row(
+        &mut self,
+        ui: &mut Ui,
+        key: &'static str,
+        text: &str,
+        allow: bool,
+        label: &str,
+        busy_label: &str,
+    ) -> bool {
+        if !allow {
+            let w = ui.available_width();
+            self.copy_box(ui, key, text, w);
+            return false;
+        }
+        let refreshing = self.state.lock().unwrap().refreshing;
+        ui.horizontal(|ui| {
+            // Reserve room for the button so the box neither overflows the row nor
+            // pushes the button onto the next line.
+            let reserve = 110.0;
+            let w = (ui.available_width() - reserve - ui.spacing().item_spacing.x).max(0.0);
+            self.copy_box(ui, key, text, w);
+            let label = if refreshing { busy_label } else { label };
+            ui.add_enabled(!refreshing, egui::Button::new(label))
+                .clicked()
+        })
+        .inner
+    }
+
+    /// Rebind the endpoint (same identity) and mint a fresh saved ticket, picking up a
+    /// new relay / ephemeral port hints for the next broadcast.
+    fn refresh_relay(&mut self, ctx: &Context) {
+        let bind = match parse_bind(&self.config) {
+            Ok(bind) => bind,
+            Err(e) => {
+                self.state.lock().unwrap().error = Some(e);
+                ctx.request_repaint();
+                return;
+            }
+        };
+        self.config.save();
+        state::spawn_refresh_ticket(
+            self.state.clone(),
+            self.handle.clone(),
+            ctx.clone(),
+            bind,
+            "Relay refreshed ✓",
+        );
+    }
+
+    /// Mint a brand-new identity: generate a fresh keypair, persist it, then rebind and
+    /// mint a ticket from it. Unlike a relay refresh this changes the endpoint id, so
+    /// previously shared tickets stop resolving to this stream.
+    pub(crate) fn reset_ticket(&mut self, ctx: &Context) {
+        let bind = match parse_bind(&self.config) {
+            Ok(bind) => bind,
+            Err(e) => {
+                self.state.lock().unwrap().error = Some(e);
+                ctx.request_repaint();
+                return;
+            }
+        };
+        let secret = SecretKey::generate();
+        self.config.secret_hex = Some(data_encoding::HEXLOWER.encode(&secret.to_bytes()));
+        self.config.save();
+        state::spawn_reset_ticket(
+            self.state.clone(),
+            self.handle.clone(),
+            ctx.clone(),
+            secret,
+            bind,
+            "Ticket reset ✓",
+        );
+    }
+
+
     /// A read-only, selectable box that copies its text on click.
+    ///
+    /// `width` is the box's laid-out width; callers pass `ui.available_width()` for
+    /// a full-row box, or a reduced width when a trailing widget (the refresh button)
+    /// shares the row.
     ///
     /// The "Copied" confirmation is drawn by [`App::toast_overlay`] as a floating
     /// pill, so it never reflows the surrounding layout. This widget owns the
     /// click and the hover affordance that advertises it.
-    fn copy_box(&mut self, ui: &mut Ui, key: &'static str, text: &str) {
+    fn copy_box(&mut self, ui: &mut Ui, key: &'static str, text: &str, width: f32) {
         // A faint accent tint reads the box as an interactive input surface. The
         // whole frame is the click target (not just the glyphs), so the copy
         // affordance is easy to hit and the tinted padding never feels dead.
@@ -227,9 +332,8 @@ impl App {
             .inner_margin(egui::Margin::symmetric(10, 6));
         let inner = frame.show(ui, |ui| {
             // Reserve a gutter on the right for the copy glyph so a long ticket
-            // neither runs under the mark nor off the window edge. The full string
-            // is still copied on click; only the *display* is elided.
-            let width = ui.available_width();
+            // neither runs under the mark nor off the box. The full string is still
+            // copied on click; only the *display* is elided.
             let text_width = (width - GLYPH_GUTTER).max(0.0);
             let display = fit_monospace(ui, text, text_width);
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -408,11 +512,15 @@ fn viewers_cell(ui: &mut Ui, viewers: usize, secs: f32) {
     });
 }
 
-/// Elide a monospace string so its rendered width fits `max_width`, appending an
-/// ellipsis when shortened. Only the *display* is truncated — callers still copy
-/// the full string. Measured with the same monospace face the box renders with, so
-/// the estimate is exact; the constant advance of a monospace font lets us compute
-/// the cut in one step rather than re-laying out per character.
+/// Middle-elide a monospace string so its rendered width fits `max_width`: the
+/// first and last runs of characters are kept and the middle is replaced with an
+/// ellipsis. Only the *display* is truncated — callers still copy the full string.
+///
+/// The tail is kept on purpose: a ticket's transport hints (relay, ephemeral ports)
+/// change at the end, so a head-only truncation would look identical between refreshes
+/// even when the ticket had actually changed. Measured with the same monospace face
+/// the box renders with, so the estimate is exact; the constant advance of a monospace
+/// font lets us compute the cut in one step rather than re-laying out per character.
 fn fit_monospace(ui: &Ui, text: &str, max_width: f32) -> String {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let full = ui
@@ -421,15 +529,23 @@ fn fit_monospace(ui: &Ui, text: &str, max_width: f32) -> String {
     if text.is_empty() || full.rect.width() <= max_width {
         return text.to_string();
     }
-    let count = text.chars().count() as f32;
-    let advance = full.rect.width() / count;
+    let count = text.chars().count();
+    let advance = full.rect.width() / count as f32;
     if advance <= 0.0 {
         return "…".to_string();
     }
-    // Reserve room for the ellipsis itself, then keep whole characters.
-    let keep = ((max_width / advance) - 1.0).max(0.0) as usize;
-    let kept: String = text.chars().take(keep).collect();
-    format!("{kept}…")
+    // Whole characters that fit, minus one slot for the ellipsis. Split the budget so
+    // both ends stay visible; the head gets the leftover so the tail (the part that
+    // actually changes) is never squeezed to nothing.
+    let budget = ((max_width / advance) as usize).saturating_sub(1);
+    if budget < 2 {
+        return "…".to_string();
+    }
+    let tail = (budget / 2).max(1);
+    let head = budget - tail;
+    let head_s: String = text.chars().take(head).collect();
+    let tail_s: String = text.chars().skip(count - tail).collect();
+    format!("{head_s}…{tail_s}")
 }
 
 /// The two sheets of the copy glyph, anchored at the right edge of a copy box.
@@ -518,10 +634,10 @@ mod tests {
         assert!(front_c.y < back_c.y, "front is above back");
     }
 
-    /// `fit_monospace` leaves text that already fits untouched, and elides a long
-    /// value to a measured width that fits — the fix for the ticket copy box running
-    /// off the box and window edge. The full string is still what gets copied; this
-    /// only checks the elided display.
+    /// `fit_monospace` leaves text that already fits untouched, and middle-elides a
+    /// long value to a measured width that fits — keeping both the head and the tail
+    /// so a ticket whose transport hints change at the end visibly changes between
+    /// refreshes. The full string is still what gets copied; this checks the display.
     #[test]
     fn fit_monospace_elides_only_when_too_wide() {
         let ctx = egui::Context::default();
@@ -540,11 +656,15 @@ mod tests {
                 "a WHIP URL that fits is unchanged"
             );
 
-            let long = "a".repeat(200);
+            let long = "abcdefghij".repeat(20);
             let elided = fit_monospace(ui, &long, 200.0);
             assert!(
-                elided.chars().count() < 200 && elided.ends_with('…'),
-                "a long ticket is elided with an ellipsis, got {elided:?}"
+                elided.contains('…') && elided.chars().count() < long.chars().count(),
+                "a long ticket is middle-elided, got {elided:?}"
+            );
+            assert!(
+                elided.starts_with('a') && elided.ends_with('j'),
+                "both ends are kept so the changing tail stays visible, got {elided:?}"
             );
             let w = ui
                 .painter()

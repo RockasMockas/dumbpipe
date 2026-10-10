@@ -1,4 +1,5 @@
-//! The Options panel: a Streaming section (WHIP flags) and a Watching section
+//! The Options panel: a Broadcasting section (WHIP flags and the current ticket)
+//! and a Watching section
 //! (default player, per-player paths, buffer, play address, verbosity).
 //!
 //! Opened from the menu bar. Edits the config live and writes it to disk on
@@ -38,7 +39,7 @@ impl App {
         // owned snapshot drops its lock immediately, so the grid's `&mut self.config`
         // borrows stay valid.
         let active = super::state::snapshot(&self.state).mode.active();
-        egui::CollapsingHeader::new("Streaming")
+        egui::CollapsingHeader::new("Broadcasting")
             .default_open(true)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!active, |ui| {
@@ -82,6 +83,26 @@ impl App {
                         });
                 });
                 ui.weak("Host, port and verbosity apply on the next start.");
+
+                ui.add_space(6.0);
+                ui.label("Current Ticket:");
+                let snap = super::state::snapshot(&self.state);
+                let ticket = snap
+                    .ticket
+                    .clone()
+                    .or_else(|| self.config.broadcast_ticket.clone())
+                    .unwrap_or_else(|| "no ticket yet — press Reset Ticket".into());
+                let requested = self.ticket_row(
+                    ui,
+                    "opt_ticket",
+                    &ticket,
+                    !active,
+                    "Reset Ticket",
+                    "Resetting…",
+                );
+                if requested {
+                    self.reset_ticket(ui.ctx());
+                }
             });
 
         ui.add_space(4.0);

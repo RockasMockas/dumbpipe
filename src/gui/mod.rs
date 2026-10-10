@@ -71,6 +71,9 @@ pub struct App {
     watch_buffer: String,
     /// The last copied box and when, for the transient toast.
     copied: Option<(&'static str, Instant)>,
+    /// A transient action-complete toast (e.g. "Relay refreshed ✓") and when it was
+    /// raised, shown by [`App::toast_overlay`] in the same pill as a copy toast.
+    toast: Option<(String, Instant)>,
     /// Clock origin for the viewers pulse, so it animates smoothly while live.
     pulse: Instant,
     /// Whether the next window-focused frame should autofocus the active tab's
@@ -108,6 +111,7 @@ impl App {
             watch_player,
             watch_buffer,
             copied: None,
+            toast: None,
             pulse: Instant::now(),
             focus_primary: true,
         }
@@ -211,18 +215,22 @@ impl App {
         }
     }
 
-    /// The floating "Copied ✓" pill, anchored bottom-centre.
+    /// The floating status pill ("Copied ✓", "Relay refreshed ✓", …), anchored
+    /// bottom-centre.
     ///
-    /// Drawn in its own foreground [`egui::Area`] rather than inline, so confirming
-    /// a copy never nudges the WHIP URL box, the ticket box or the stats panel. The
-    /// repaint guard in [`App::draw`] keeps frames coming while it is up and expires
-    /// `copied` via [`expire_copied`], so the fade completes exactly as repaints
-    /// stop and no half-faded pill is left on screen.
+    /// Drawn in its own foreground [`egui::Area`] rather than inline, so confirming a
+    /// copy or a relay/ticket action never nudges the WHIP URL box, the ticket box or
+    /// the stats panel. A copy toast (`copied`) takes precedence over an action toast
+    /// (`toast`) when both are momentarily live. The repaint guard in [`App::draw`]
+    /// keeps frames coming while either is up and expires them, so the fade completes
+    /// exactly as repaints stop and no half-faded pill is left on screen.
     fn toast_overlay(&self, ui: &Ui) {
-        // `App::ui` already expired `copied` for this frame, so if it is still set
-        // the toast is live; the expiry threshold lives in one place.
-        let Some((_, at)) = self.copied else {
-            return;
+        // `App::draw` already expired both for this frame, so if either is still set
+        // it is live; the expiry threshold lives in one place there.
+        let (text, at) = match (&self.copied, &self.toast) {
+            (Some((_, at)), _) => ("Copied ✓", *at),
+            (None, Some((msg, at))) => (msg.as_str(), *at),
+            (None, None) => return,
         };
         let elapsed = at.elapsed();
         // Fade the whole pill out over its remaining lifetime.
@@ -238,7 +246,7 @@ impl App {
             .show(ui.ctx(), |ui| {
                 frame.show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Copied ✓")
+                        egui::RichText::new(text)
                             .strong()
                             .color(ACCENT.gamma_multiply(alpha)),
                     );
@@ -257,9 +265,36 @@ impl App {
         // this same frame re-arms `copied` with a fresh `Instant`, so expiring here
         // never races a click.
         self.copied = expire_copied(self.copied, TOAST);
+        self.toast = self.toast.take().filter(|(_, at)| at.elapsed() < TOAST);
 
-        let mode = self.state.lock().unwrap().mode;
-        if mode.active() || self.copied.is_some() {
+        let (mode, refreshing) = {
+            let g = self.state.lock().unwrap();
+            (g.mode, g.refreshing)
+        };
+        // Pick up any completion notice a background task left (relay refresh or
+        // ticket reset) and raise it as a toast. Taken under the same brief lock that
+        // reads mode/refreshing.
+        let notice = self.state.lock().unwrap().notice.take();
+        if let Some(msg) = notice {
+            self.toast = Some((msg, Instant::now()));
+        }
+        // Persist a ticket minted while idle (via Refresh Relay / Reset Ticket) so the
+        // saved "current ticket" survives restarts. Guarded to a real change so we
+        // never rewrite config.json every frame. The live broadcast path persists its
+        // own ticket in the broadcast tab, so this only runs when idle.
+        if !mode.active() {
+            let g = self.state.lock().unwrap();
+            if let Some(t) = g.ticket.as_ref() {
+                if Some(t) != self.config.broadcast_ticket.as_ref() {
+                    self.config.broadcast_ticket = Some(t.clone());
+                    drop(g);
+                    self.config.save();
+                }
+            }
+        }
+        // Repaint while live, while a toast fades, or while a refresh is in flight so
+        // the button re-enables and the new ticket appears without user input.
+        if mode.active() || refreshing || self.copied.is_some() || self.toast.is_some() {
             ui.ctx().request_repaint_after(REPAINT);
         }
 
