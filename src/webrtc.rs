@@ -99,10 +99,7 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a viewer waits before redialing a host that went away.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Capacity of the per-viewer media queue.
-///
-/// A viewer that cannot drain this fast enough loses packets, which is the
-/// correct behaviour for realtime media.
-const VIEWER_QUEUE: usize = 512;
+const VIEWER_QUEUE: usize = 8192;
 /// Size of the buffer used to read from the ICE UDP socket.
 const ICE_BUF: usize = 2048;
 
@@ -163,6 +160,9 @@ impl Player {
                         cmd.push("--profile=low-latency".into());
                     }
                 }
+                // Enlarge the RTP/UDP receive socket buffer that lavf opens for
+                // the SDP. mpv's default is the OS default (~200 KB)
+                cmd.push("--demuxer-lavf-o=buffer_size=4194304".into());
                 cmd.push(file);
                 cmd
             }

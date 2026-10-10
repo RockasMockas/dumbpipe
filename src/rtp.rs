@@ -54,7 +54,8 @@ pub const FRAG_HEADER_LEN: usize = 5;
 const FRAG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The number of datagrams the [`Reassembler`] tracks at once.
-const FRAG_PENDING: usize = 8;
+///
+const FRAG_PENDING: usize = 1024;
 
 /// Split a datagram that is too large into fragments that fit into `max`
 /// bytes each.
@@ -227,10 +228,7 @@ pub fn reorder_timeout_for(buffer: Option<Duration>) -> Duration {
 }
 
 /// The most packets the [`Reorder`] holds per media at once.
-///
-/// A bound on memory: if reordering is so bad that this many packets pile up,
-/// the stream is unusable anyway, so the held packets are flushed in order.
-const REORDER_CAP: usize = 256;
+const REORDER_CAP: usize = 8192;
 
 /// Puts RTP packets back into sequence order.
 ///
