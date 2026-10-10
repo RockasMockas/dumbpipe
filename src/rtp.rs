@@ -211,7 +211,7 @@ const REORDER_TIMEOUT: Duration = Duration::from_millis(80);
 /// within these bounds: never below what covers ordinary reordering, never so
 /// long that we sit on holes that are really lost packets.
 const REORDER_TIMEOUT_MIN: Duration = Duration::from_millis(40);
-const REORDER_TIMEOUT_MAX: Duration = Duration::from_millis(150);
+const REORDER_TIMEOUT_MAX: Duration = Duration::from_millis(500);
 
 /// Derive the viewer's reorder window from the player buffer.
 ///
@@ -219,7 +219,7 @@ const REORDER_TIMEOUT_MAX: Duration = Duration::from_millis(150);
 /// the small, fast stage in front of it. We take a quarter of the buffer,
 /// clamped to [`REORDER_TIMEOUT_MIN`]..=[`REORDER_TIMEOUT_MAX`], so a bigger
 /// buffer nudges us toward catching worse long-distance reordering without
-/// turning the reorder stage into a latency trap (a hole unfilled after ~150 ms
+/// turning the reorder stage into a latency trap (a hole unfilled after ~500 ms
 /// is a lost QUIC datagram, not a reordered one). `None` (no buffer, lowest
 /// latency) keeps the default [`REORDER_TIMEOUT`].
 pub fn reorder_timeout_for(buffer: Option<Duration>) -> Duration {
@@ -999,6 +999,10 @@ mod tests {
         );
         assert_eq!(
             reorder_timeout_for(Some(Duration::from_millis(1000))),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            reorder_timeout_for(Some(Duration::from_millis(3000))),
             REORDER_TIMEOUT_MAX,
             "capped so we never sit on lost packets"
         );

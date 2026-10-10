@@ -98,8 +98,10 @@ const WAIT_INTERVAL: Duration = Duration::from_secs(5);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a viewer waits before redialing a host that went away.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-/// Capacity of the per-viewer media queue.
-const VIEWER_QUEUE: usize = 8192;
+/// Capacity of the per-viewer media queue. Sized generously (~65k packets,
+/// ~80 MB) so a fast LAN burst is absorbed in memory while the UDP pacer
+/// drains it at the OS-safe rate, instead of dropping packets internally.
+const VIEWER_QUEUE: usize = 65536;
 /// Size of the buffer used to read from the ICE UDP socket.
 const ICE_BUF: usize = 2048;
 
@@ -1737,12 +1739,15 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             // where FFmpeg ignores -buffer_size, so it is bounded by the OS default
             // SO_RCVBUF (~50-212 KB). When the reorder stage flushes a held burst it
             // can dump >100 KB at once and overrun that socket, dropping packets.
-            // A token bucket caps a burst to 64 KB and refills at 16 KB/ms (16 MB/s,
-            // ~128 Mbps): zero latency in steady state (the bucket stays full far
-            // above the 6 Mbps stream), but a dense flush is spread over a few ms so
-            // the player can drain its buffer.
-            const BURST_CAP: usize = 64 * 1024;
-            const TOKEN_RATE: usize = 16 * 1024; // bytes per ms
+            // A token bucket caps a burst to 42 KB and refills at 32 KB/ms. The cap
+            // is strictly below the OS default UDP SO_RCVBUF (50 KB macOS, 64 KB
+            // Windows), so a dense flush never overruns the kernel socket and gets its
+            // tail dropped (the "RTP: missed X packets" / decode-error symptom). The
+            // refill rate is high enough that a Windows ~15.6 ms sleep overshoot fully
+            // refills the 42 KB bucket, giving a reliable ~21.5 Mbps ceiling there and
+            // >100 Mbps on Linux/macOS, without clipping accumulated tokens.
+            const BURST_CAP: usize = 42 * 1024;
+            const TOKEN_RATE: usize = 32 * 1024; // bytes per ms
             let mut tokens = BURST_CAP;
             let mut last_fill = tokio::time::Instant::now();
             while let Some(msg) = forward_rx.recv().await {
@@ -1757,18 +1762,38 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         let required = packet.len().min(BURST_CAP);
                         loop {
                             let now = tokio::time::Instant::now();
-                            let elapsed_micros = now.duration_since(last_fill).as_micros() as u64;
-                            if elapsed_micros > 0 {
+                            let elapsed_micros =
+                                now.duration_since(last_fill).as_micros() as u64;
+                            if elapsed_micros >= 100_000 {
+                                // Idle for >= 100ms: snap to full, prevent huge multiplier
+                                tokens = BURST_CAP;
+                                last_fill = now;
+                            } else {
                                 let added =
                                     ((elapsed_micros * (TOKEN_RATE as u64)) / 1000) as usize;
-                                tokens = (tokens + added).min(BURST_CAP);
-                                last_fill = now;
+                                if added > 0 {
+                                    tokens += added;
+                                    if tokens >= BURST_CAP {
+                                        tokens = BURST_CAP;
+                                        last_fill = now;
+                                    } else {
+                                        // Advance last_fill by the exact time these tokens took
+                                        // to accrue, carrying any microsecond remainder in the
+                                        // bank so pacing stays true to TOKEN_RATE.
+                                        let consumed_micros =
+                                            (added as u64 * 1000) / (TOKEN_RATE as u64);
+                                        last_fill +=
+                                            std::time::Duration::from_micros(consumed_micros);
+                                    }
+                                }
                             }
                             if tokens >= required {
                                 tokens -= required;
                                 break;
                             }
-                            tokio::task::yield_now().await;
+                            // Sleep (not yield_now) so we release the core to the media
+                            // player doing software decode instead of starving it.
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
                         forward(
                             &forward_video,
