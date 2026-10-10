@@ -15,19 +15,34 @@ use super::{
 };
 
 impl App {
-    /// Show the Options window, closing it when its close button is pressed.
+    /// Show the Options window, closing it when its close button is pressed or
+    /// the Escape key is hit.
     pub fn options_window(&mut self, ctx: &Context) {
         // A local `open` avoids borrowing a field of `self` while the content
         // closure also borrows `self` mutably.
         let mut open = true;
+        // Span the full width of the viewport (minus a small margin) and pin it
+        // there so it snaps open edge-to-edge on the first frame — no fade and no
+        // deferred auto-sizing pass that would otherwise stall the width until the
+        // mouse moves. Anchored top-left; still vertically resizable.
+        let margin = 8.0;
+        let width = (ctx.viewport_rect().width() - margin * 2.0).max(320.0);
         egui::Window::new("Settings")
-            .default_width(380.0)
-            .resizable(true)
+            .anchor(egui::Align2::LEFT_TOP, [margin, margin])
+            .default_width(width)
+            .min_width(width)
+            .max_width(width)
+            .fade_in(false)
+            .resizable([false, true])
             .open(&mut open)
             .show(ctx, |ui| {
                 self.options_content(ui);
             });
         if !open {
+            self.show_options = false;
+        }
+        // Escape closes the overlay too, mirroring the close button.
+        if self.show_options && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_options = false;
         }
     }
