@@ -33,6 +33,10 @@ const TOAST: Duration = Duration::from_millis(1500);
 /// How long a copy box's click flash brightens its fill and glyph. Shorter than
 /// [`TOAST`] so the repaint guard stays armed through the whole flash.
 const FLASH: Duration = Duration::from_millis(450);
+/// How long to keep frames coming after the settings window opens, so its
+/// collapsing-header open animation runs to completion without the user nudging
+/// it with the mouse. Comfortably longer than egui's default animation time.
+const SETTINGS_ANIM: Duration = Duration::from_millis(400);
 /// The "live/success" accent: broadcasting status, the copy toast, and viewers.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
@@ -61,6 +65,11 @@ pub struct App {
     tab: Tab,
     /// Whether the options panel is open.
     show_options: bool,
+    /// Clock origin for the settings window's open animation. Armed when the panel
+    /// opens so [`App::draw`] keeps frames coming until the animation completes on
+    /// its own — egui's collapsing-header easing otherwise only advances on the
+    /// next input event, leaving the panel half-open until the mouse moves.
+    options_anim: Option<Instant>,
     /// Whether the bottom log panel is expanded.
     log_open: bool,
     /// The ticket text on the Watch tab.
@@ -107,6 +116,7 @@ impl App {
             stats_tx,
             tab: Tab::Watch,
             show_options: false,
+            options_anim: None,
             log_open: false,
             watch_player,
             watch_buffer,
@@ -124,12 +134,14 @@ impl App {
         // Options toggle, so the pulse clock is read here.
         let secs = self.pulse.elapsed().as_secs_f32();
         egui::menu::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("Options", |ui| {
-                if ui.button("Settings…").clicked() {
-                    self.show_options = !self.show_options;
-                    ui.close();
+            // Open the settings panel directly — no intermediate dropdown. Arm the
+            // settle timer so the panel's open animation completes on its own.
+            if ui.button("Settings").clicked() {
+                self.show_options = !self.show_options;
+                if self.show_options {
+                    self.options_anim = Some(Instant::now());
                 }
-            });
+            }
             ui.separator();
             let base = match snap.mode {
                 Mode::Idle => egui::Color32::GRAY,
@@ -342,6 +354,15 @@ impl App {
             self.menu_bar(ui);
         });
         if self.show_options {
+            // Keep frames coming for a short window after opening so the panel's
+            // collapsing-header animation finishes without waiting on input.
+            if let Some(at) = self.options_anim {
+                if at.elapsed() < SETTINGS_ANIM {
+                    ui.ctx().request_repaint();
+                } else {
+                    self.options_anim = None;
+                }
+            }
             self.options_window(ui.ctx());
         }
         self.log_panel(ui);
@@ -792,9 +813,10 @@ mod tests {
     }
 
     /// Count the interactive rects on the Watch tab that are the size of the
-    /// "Watch Stream" button (its `min_size` is 160×30; nothing else on the tab is
-    /// ~30 tall). `interactive_rects_last_pass` filters out disabled widgets, so a
-    /// blank ticket — which disables the button — yields zero.
+    /// full-width "Watch Stream" button (it is `add_sized` to 36 tall; the tab
+    /// strip buttons are 32 and the multiline ticket box ~70, so a 34..=38 band
+    /// isolates the primary action). `interactive_rects_last_pass` filters out
+    /// disabled widgets, so a blank ticket — which disables the button — yields zero.
     ///
     /// The faint "paste a ticket to begin" hint is *not* counted: egui registers
     /// hover-sense rects for plain labels too, so a naive total count would tie
@@ -818,7 +840,7 @@ mod tests {
         }
         ctx.interactive_rects_last_pass()
             .iter()
-            .filter(|r| (28.0..=32.0).contains(&r.height()))
+            .filter(|r| (34.0..=38.0).contains(&r.height()))
             .count()
     }
 

@@ -20,7 +20,7 @@ impl App {
         // A local `open` avoids borrowing a field of `self` while the content
         // closure also borrows `self` mutably.
         let mut open = true;
-        egui::Window::new("Options")
+        egui::Window::new("Settings")
             .default_width(380.0)
             .resizable(true)
             .open(&mut open)
