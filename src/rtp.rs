@@ -280,8 +280,10 @@ impl Reorder {
 
     /// Feed one packet by its RTP sequence number.
     ///
-    /// Returns the packets to hand to the player now, in sequence order: the
-    /// packet itself if it closes the gap, plus any held packets it unblocks.
+    /// Returns the packets to hand to the player now: the packet itself if it
+    /// closes the gap, plus any held packets it unblocks. A packet older than
+    /// the next expected (too late to reorder here) is passed through untouched
+    /// so a downstream jitter buffer can still recover it.
     pub fn push(&mut self, seq: u16, packet: Vec<u8>, now: Instant) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         match self.next {
@@ -293,8 +295,11 @@ impl Reorder {
             Some(next) => {
                 let ahead = seq.wrapping_sub(next) as i16;
                 if ahead < 0 {
-                    // Older than the next expected: too late, or a duplicate past
-                    // a hole we already flushed. Drop it.
+                    // Older than the next expected: too late for this stage to
+                    // reorder, but a downstream jitter buffer (ffplay's --buffer)
+                    // can still salvage it. Emit it untouched rather than
+                    // destroying a packet the player might recover.
+                    out.push(packet);
                     return out;
                 }
                 if ahead == 0 {
@@ -941,15 +946,15 @@ mod tests {
     }
 
     #[test]
-    fn reorder_drops_packets_past_a_flushed_hole() {
+    fn reorder_emits_packets_past_a_flushed_hole() {
         let mut r = Reorder::default();
         let t0 = Instant::now();
         assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
         assert!(r.push(3, vec![3], t0).is_empty());
         // the hole at 2 is abandoned after the timeout
         assert_eq!(r.push(4, vec![4], t0 + REORDER_TIMEOUT), vec![vec![3], vec![4]]);
-        // the very late 2 must not be emitted out of order now
-        assert!(r.push(2, vec![2], t0 + REORDER_TIMEOUT).is_empty(), "too late");
+        // the very late 2 is passed through so a downstream buffer can reorder
+        assert_eq!(r.push(2, vec![2], t0 + REORDER_TIMEOUT), vec![vec![2]]);
     }
 
     #[test]

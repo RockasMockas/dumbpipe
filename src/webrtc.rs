@@ -1584,6 +1584,14 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             // packets are actually written to the player.
             let mut last_seq: Option<u16> = None;
             let mut last_kf: Option<Instant> = None;
+            // Pace local UDP writes: ffplay opens its RTP socket via an SDP file
+            // where FFmpeg ignores -buffer_size, so it is bounded by the OS default
+            // SO_RCVBUF (~50-212 KB). When the reorder stage flushes a held burst it
+            // can dump >100 KB at once and overrun that socket, dropping packets.
+            // Throttle bursts to ~16 KB/ms: zero latency in steady state, but a
+            // dense flush is spread over a few ms so the player can drain its buffer.
+            let mut burst_bytes = 0usize;
+            let mut burst_start = tokio::time::Instant::now();
             while let Some(msg) = forward_rx.recv().await {
                 match msg {
                     ForwardMsg::Epoch => {
@@ -1593,6 +1601,7 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         last_kf = Some(Instant::now());
                     }
                     ForwardMsg::Packet(port, packet, is_video) => {
+                        let len = packet.len();
                         forward(
                             &forward_video,
                             &packet,
@@ -1604,6 +1613,16 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                             &forward_kf_tx,
                         )
                         .await;
+                        burst_bytes += len;
+                        if burst_bytes > 16384 {
+                            let elapsed = burst_start.elapsed();
+                            let budget = Duration::from_millis(1);
+                            if elapsed < budget {
+                                tokio::time::sleep(budget - elapsed).await;
+                            }
+                            burst_bytes = 0;
+                            burst_start = tokio::time::Instant::now();
+                        }
                     }
                 }
             }
