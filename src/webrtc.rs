@@ -148,21 +148,32 @@ impl Player {
                     // watched position from a previous run.
                     "--no-resume-playback".to_string(),
                 ];
+                // Merge lavf options into one argument so buffer_size,
+                // max_delay and reorder_queue_size are not overridden by a
+                // second --demuxer-lavf-o. ffmpeg's default reorder_queue_size
+                // is 500 packets, which overflows ("jitter buffer full") before
+                // max_delay is reached at high bitrate; raise the ceiling so the
+                // author's two-stage reorder (dumbpipe + ffmpeg) works as intended.
+                let mut lavf_o = "buffer_size=4194304".to_string();
                 match buffer {
                     Some(ms) => {
                         cmd.push("--cache=yes".into());
                         cmd.push(format!("--demuxer-readahead-secs={}", ms.as_secs_f64()));
                         // `max_delay` is the RTP demuxer's reorder window in us.
-                        cmd.push(format!("--demuxer-lavf-o=max_delay={}", ms.as_micros()));
+                        lavf_o.push_str(&format!(
+                            ",max_delay={},reorder_queue_size=32768",
+                            ms.as_micros()
+                        ));
                     }
                     None => {
                         cmd.push("--no-cache".into());
                         cmd.push("--profile=low-latency".into());
+                        // dumbpipe already strictly reorders RTP, so neuter
+                        // ffmpeg's redundant queue to avoid its 100 ms default wait.
+                        lavf_o.push_str(",max_delay=0,reorder_queue_size=0");
                     }
                 }
-                // Enlarge the RTP/UDP receive socket buffer that lavf opens for
-                // the SDP. mpv's default is the OS default (~200 KB)
-                cmd.push("--demuxer-lavf-o=buffer_size=4194304".into());
+                cmd.push(format!("--demuxer-lavf-o={}", lavf_o));
                 cmd.push(file);
                 cmd
             }
@@ -181,11 +192,27 @@ impl Player {
                     Some(ms) => {
                         // Drop corrupt packets instead of feeding them to the
                         // decoder, and let the RTP receiver wait for reordering.
+                        // Raise reorder_queue_size above ffmpeg's 500-packet default
+                        // so max_delay is honoured without a premature "jitter
+                        // buffer full" flush at high bitrate.
                         cmd.extend(["-fflags".into(), "+discardcorrupt".into()]);
-                        cmd.extend(["-max_delay".into(), ms.as_micros().to_string()]);
+                        cmd.extend([
+                            "-max_delay".into(),
+                            ms.as_micros().to_string(),
+                            "-reorder_queue_size".into(),
+                            "32768".into(),
+                        ]);
                     }
                     None => {
+                        // dumbpipe already strictly reorders RTP, so disable
+                        // ffmpeg's queue to avoid its 100 ms default wait.
                         cmd.extend(["-fflags".into(), "nobuffer".into()]);
+                        cmd.extend([
+                            "-max_delay".into(),
+                            "0".into(),
+                            "-reorder_queue_size".into(),
+                            "0".into(),
+                        ]);
                     }
                 }
                 cmd.extend([
@@ -2284,13 +2311,15 @@ mod tests {
         assert_eq!(mpv[0], "mpv");
         assert!(mpv.contains(&"--profile=low-latency".to_string()));
         assert!(mpv.contains(&"--no-resume-playback".to_string()));
+        assert!(mpv.iter().any(|a| a.contains("max_delay=0")));
+        assert!(mpv.iter().any(|a| a.contains("reorder_queue_size=0")));
         assert_eq!(mpv.last().unwrap(), "/tmp/x.sdp");
         assert!(Player::Vlc
             .command(path, None, None)
             .contains(&"--network-caching=100".to_string()));
-        assert!(Player::Ffplay
-            .command(path, None, None)
-            .contains(&"nobuffer".to_string()));
+        let ffplay = Player::Ffplay.command(path, None, None);
+        assert!(ffplay.contains(&"nobuffer".to_string()));
+        assert!(ffplay.iter().any(|a| a == "0"));
         assert!(!Player::None.launches());
         assert!(Player::Mpv.launches());
     }
@@ -2319,11 +2348,14 @@ mod tests {
         assert!(mpv.contains(&"--cache=yes".to_string()));
         assert!(mpv.contains(&"--no-resume-playback".to_string()));
         assert!(mpv.iter().any(|a| a.contains("max_delay=300000")));
+        assert!(mpv.iter().any(|a| a.contains("reorder_queue_size=32768")));
+        assert!(mpv.iter().any(|a| a.contains("buffer_size=4194304")));
 
         let ffplay = Player::Ffplay.command(path, Some(ms), None);
         assert!(!ffplay.iter().any(|a| a == "nobuffer"));
         assert!(ffplay.contains(&"+discardcorrupt".to_string()));
         assert!(ffplay.iter().any(|a| a == "300000"));
+        assert!(ffplay.iter().any(|a| a == "32768"));
 
         let vlc = Player::Vlc.command(path, Some(ms), None);
         assert!(vlc.contains(&"--network-caching=300".to_string()));
