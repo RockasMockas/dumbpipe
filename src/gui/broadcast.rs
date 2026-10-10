@@ -6,9 +6,14 @@ use std::time::Instant;
 use eframe::egui::{self, Context, Ui};
 
 use super::{
+    flash_alpha,
     state::{self, BroadcastParams, Mode},
-    App, ACCENT,
+    App, ACCENT, FLASH,
 };
+
+/// Horizontal room kept clear at the right edge of a copy box for the copy glyph,
+/// so a long value is elided before it reaches the mark.
+const GLYPH_GUTTER: f32 = 26.0;
 
 impl App {
     /// Render the Start Broadcasting tab.
@@ -142,20 +147,55 @@ impl App {
         // A faint accent tint reads the box as an interactive input surface. The
         // whole frame is the click target (not just the glyphs), so the copy
         // affordance is easy to hit and the tinted padding never feels dead.
+        // A click briefly lifts the tint toward the accent (see `flash_alpha`).
+        // `copied` is `Copy`, so reading it here leaves it intact for the click
+        // handler below; the click's repaint shows the flash from the next frame.
+        let flash = self
+            .copied
+            .filter(|(k, _)| *k == key)
+            .map(|(_, at)| flash_alpha(at.elapsed(), FLASH))
+            .unwrap_or(0.0);
+        let fill_alpha = (14.0 + flash * 70.0) as u8;
         let frame = egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgba_unmultiplied(80, 200, 120, 14))
+            .fill(egui::Color32::from_rgba_unmultiplied(
+                80, 200, 120, fill_alpha,
+            ))
             .inner_margin(egui::Margin::symmetric(10, 6));
         let inner = frame.show(ui, |ui| {
+            // Reserve a gutter on the right for the copy glyph so a long ticket
+            // neither runs under the mark nor off the window edge. The full string
+            // is still copied on click; only the *display* is elided.
             let width = ui.available_width();
-            ui.add_sized(
-                [width, 22.0],
-                egui::Label::new(egui::RichText::new(text).monospace()),
-            );
+            let text_width = (width - GLYPH_GUTTER).max(0.0);
+            let display = fit_monospace(ui, text, text_width);
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+            let color = ui.style().visuals.text_color();
+            let galley = ui
+                .painter()
+                .layout_no_wrap(display, font_id, egui::Color32::PLACEHOLDER);
+            // Lay the value out ourselves at the row's left edge rather than via
+            // `add_sized`, which was offsetting the galley toward the centre and
+            // spilling long values past the box.
+            let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, 22.0));
+            ui.allocate_rect(row, egui::Sense::hover());
+            let y = row.center().y - galley.rect.height() * 0.5;
+            ui.painter().galley(egui::pos2(row.min.x, y), galley, color);
         });
         // Sense the click over the frame's full rect so the padding is live too.
         // `on_hover_text` consumes the response, so interactions are read off it
         // before it is handed to the tooltip.
         let rect = inner.response.rect;
+        // A small "copy" glyph (two overlapping sheets) at the right edge, painted
+        // non-interactively so it never steals the box's click.
+        let glyph = ACCENT.gamma_multiply(0.5 + 0.5 * flash);
+        for sheet in copy_glyph_rects(rect) {
+            ui.painter().rect_stroke(
+                sheet,
+                1.0,
+                egui::Stroke::new(1.0, glyph),
+                egui::StrokeKind::Inside,
+            );
+        }
         let resp = ui.interact(rect, ui.id().with(("copy", key)), egui::Sense::click());
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -276,11 +316,120 @@ fn viewers_cell(ui: &mut Ui, viewers: usize, secs: f32) {
     });
 }
 
+/// Elide a monospace string so its rendered width fits `max_width`, appending an
+/// ellipsis when shortened. Only the *display* is truncated — callers still copy
+/// the full string. Measured with the same monospace face the box renders with, so
+/// the estimate is exact; the constant advance of a monospace font lets us compute
+/// the cut in one step rather than re-laying out per character.
+fn fit_monospace(ui: &Ui, text: &str, max_width: f32) -> String {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let full = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, egui::Color32::PLACEHOLDER);
+    if text.is_empty() || full.rect.width() <= max_width {
+        return text.to_string();
+    }
+    let count = text.chars().count() as f32;
+    let advance = full.rect.width() / count;
+    if advance <= 0.0 {
+        return "…".to_string();
+    }
+    // Reserve room for the ellipsis itself, then keep whole characters.
+    let keep = ((max_width / advance) - 1.0).max(0.0) as usize;
+    let kept: String = text.chars().take(keep).collect();
+    format!("{kept}…")
+}
+
+/// The two sheets of the copy glyph, anchored at the right edge of a copy box.
+///
+/// Returns `[back, front]`: two small overlapping rounded rects, the front offset
+/// up-right of the back, so the pair reads as the universal "copy" mark without
+/// relying on a font glyph the bundled faces may not carry.
+fn copy_glyph_rects(rect: egui::Rect) -> [egui::Rect; 2] {
+    let size = egui::vec2(8.0, 9.0);
+    let cx = rect.right() - 16.0;
+    let cy = rect.center().y;
+    let offset = 3.0;
+    let front = egui::Rect::from_center_size(egui::pos2(cx + offset, cy - offset), size);
+    let back = egui::Rect::from_center_size(egui::pos2(cx - offset, cy + offset), size);
+    [back, front]
+}
+
 /// Format a number of seconds as `42s`, `7m13s` or `1h02m03s`.
 fn format_elapsed(secs: u64) -> String {
     match (secs / 3600, (secs % 3600) / 60, secs % 60) {
         (0, 0, s) => format!("{s}s"),
         (0, m, s) => format!("{m}m{s:02}s"),
         (h, m, s) => format!("{h}h{m:02}m{s:02}s"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The copy glyph's two sheets sit inside the box, are non-degenerate, and the
+    /// front reads up-right of the back. Guards against a misplaced or absent glyph
+    /// that a full-render shape count would not catch.
+    #[test]
+    fn copy_glyph_sheets_are_in_bounds_and_offset() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 34.0));
+        let [back, front] = copy_glyph_rects(rect);
+        for sheet in [back, front] {
+            assert!(
+                sheet.width() > 0.0 && sheet.height() > 0.0,
+                "non-degenerate"
+            );
+            assert!(
+                rect.contains(sheet.min) && rect.contains(sheet.max),
+                "in bounds"
+            );
+        }
+        let front_c = front.center();
+        let back_c = back.center();
+        assert!(front_c.x > back_c.x, "front is right of back");
+        assert!(front_c.y < back_c.y, "front is above back");
+    }
+
+    /// `fit_monospace` leaves text that already fits untouched, and elides a long
+    /// value to a measured width that fits — the fix for the ticket copy box running
+    /// off the box and window edge. The full string is still what gets copied; this
+    /// only checks the elided display.
+    #[test]
+    fn fit_monospace_elides_only_when_too_wide() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(760.0, 560.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            let short = "http://127.0.0.1:8080/whip";
+            assert_eq!(
+                fit_monospace(ui, short, 400.0),
+                short,
+                "a WHIP URL that fits is unchanged"
+            );
+
+            let long = "a".repeat(200);
+            let elided = fit_monospace(ui, &long, 200.0);
+            assert!(
+                elided.chars().count() < 200 && elided.ends_with('…'),
+                "a long ticket is elided with an ellipsis, got {elided:?}"
+            );
+            let w = ui
+                .painter()
+                .layout_no_wrap(
+                    elided.clone(),
+                    egui::TextStyle::Monospace.resolve(ui.style()),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .rect
+                .width();
+            assert!(w <= 200.0, "elided display width {w} must fit 200");
+        });
+        out.textures_delta.clear();
     }
 }

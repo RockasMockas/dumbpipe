@@ -308,6 +308,12 @@ pub struct WatchParams {
 }
 
 /// Start a watch session, returning its task handle to store in the state.
+///
+/// Mirrors [`spawn_broadcast`]: sets the mode to `Starting` synchronously, then
+/// brings the endpoint online and resolves the play-out address, flipping to
+/// `Watching` only once the play address resolves and immediately before dialing
+/// (the closest honest "ready" signal available — [`ViewerConfig`] carries no
+/// player-launch callback).
 pub fn spawn_watch(
     state: Arc<Mutex<SharedState>>,
     handle: Handle,
@@ -316,7 +322,7 @@ pub fn spawn_watch(
 ) -> JoinHandle<()> {
     {
         let mut g = state.lock().unwrap();
-        g.mode = Mode::Watching;
+        g.mode = Mode::Starting;
         g.error = None;
     }
     ctx.request_repaint();
@@ -332,6 +338,14 @@ pub fn spawn_watch(
             Ok(play) => play,
             Err(e) => return fail(&state, &ctx, format!("invalid play address: {e:#}")),
         };
+        // The endpoint is online and the play address resolves: we are ready to
+        // dial. Flip to `Watching` now (just before `connect_whip`, the sole
+        // player-launch point) so the UI never claims "playing" during bring-up.
+        {
+            let mut g = state.lock().unwrap();
+            g.mode = Mode::Watching;
+        }
+        ctx.request_repaint();
         let cfg = ViewerConfig {
             addr: params.addr,
             alpn: WEBRTC_ALPN.to_vec(),
@@ -454,6 +468,47 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Regression (AC1): `spawn_watch` used to set `Watching` synchronously, so
+    /// the Watch tab claimed "playing in a player window" the instant the button
+    /// was clicked, while the endpoint was still binding/coming online. It must
+    /// arm `Starting` synchronously (mirroring `spawn_broadcast`) and only flip to
+    /// `Watching` later, after `udp::resolve` succeeds and just before dialing.
+    ///
+    /// A `current_thread` runtime is built but never run, so the async body is
+    /// never polled and the mode stays where the synchronous block left it.
+    #[test]
+    fn spawn_watch_arms_starting_before_it_comes_online() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let secret = SecretKey::generate();
+        let state = Arc::new(Mutex::new(SharedState::new(
+            secret.clone(),
+            whip_url("127.0.0.1", 8080),
+        )));
+
+        spawn_watch(
+            state.clone(),
+            rt.handle().clone(),
+            egui::Context::default(),
+            WatchParams {
+                addr: EndpointAddr::new(secret.public()),
+                player: Player::default(),
+                player_path: None,
+                play_addr: "127.0.0.1:0".into(),
+                buffer_ms: None,
+            },
+        );
+
+        assert_eq!(
+            state.lock().unwrap().mode,
+            Mode::Starting,
+            "the mode must be `Starting` immediately, not `Watching`"
+        );
+        drop(rt);
     }
 
     /// A cached endpoint is reused while open, but a closed one (as `listen_whip`

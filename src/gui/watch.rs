@@ -17,6 +17,22 @@ pub fn parse_buffer_ms(text: &str) -> Option<u64> {
     text.trim().parse::<u64>().ok()
 }
 
+/// The status label shown beside Stop while a watch session is up.
+///
+/// `Starting` reads "connecting…" so the tab never claims a player window exists
+/// before the endpoint is online and the play address has resolved.
+fn watch_action_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Starting => "connecting…",
+        _ => "playing in a player window",
+    }
+}
+
+/// Whether the "Watch Stream" button is actionable: idle, with a non-blank ticket.
+fn watch_can_start(busy: bool, ticket: &str) -> bool {
+    !busy && !ticket.trim().is_empty()
+}
+
 impl App {
     /// Render the Watch Stream tab.
     pub fn watch_tab(&mut self, ui: &mut Ui) {
@@ -96,17 +112,18 @@ impl App {
                 {
                     state::stop(&self.state, ui.ctx());
                 }
-                ui.label(match snap.mode {
-                    Mode::Starting => "connecting…",
-                    _ => "playing in a player window",
-                });
+                ui.label(watch_action_label(snap.mode));
             } else {
                 let button = egui::Button::new("▶  Watch Stream")
                     .min_size(egui::vec2(160.0, 30.0))
                     .fill(ACCENT.gamma_multiply(0.18))
                     .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
-                if ui.add_enabled(!busy, button).clicked() {
+                let can_start = watch_can_start(busy, &self.watch_ticket);
+                if ui.add_enabled(can_start, button).clicked() {
                     self.start_watch(ui.ctx());
+                }
+                if !busy && self.watch_ticket.trim().is_empty() {
+                    ui.weak("paste a ticket to begin");
                 }
             }
         });
@@ -172,5 +189,27 @@ impl App {
             .buffer_ms
             .map(|ms| ms.to_string())
             .unwrap_or_default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_action_label_distinguishes_connecting_from_playing() {
+        assert_eq!(watch_action_label(Mode::Starting), "connecting…");
+        assert_eq!(
+            watch_action_label(Mode::Watching),
+            "playing in a player window"
+        );
+    }
+
+    #[test]
+    fn watch_can_start_needs_idle_and_a_non_blank_ticket() {
+        assert!(!watch_can_start(false, " "));
+        assert!(!watch_can_start(false, ""));
+        assert!(watch_can_start(false, "abc"));
+        assert!(!watch_can_start(true, "abc"));
     }
 }

@@ -30,6 +30,9 @@ use self::{
 const REPAINT: Duration = Duration::from_millis(250);
 /// How long a "Copied" toast stays visible.
 const TOAST: Duration = Duration::from_millis(1500);
+/// How long a copy box's click flash brightens its fill and glyph. Shorter than
+/// [`TOAST`] so the repaint guard stays armed through the whole flash.
+const FLASH: Duration = Duration::from_millis(450);
 /// The "live/success" accent: broadcasting status, the copy toast, and viewers.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
@@ -106,6 +109,9 @@ impl App {
     /// The top menu bar with the status and the Options entry.
     fn menu_bar(&mut self, ui: &mut Ui) {
         let snap = state::snapshot(&self.state);
+        // Computed before the closure: the closure mutably borrows `self` for the
+        // Options toggle, so the pulse clock is read here.
+        let secs = self.pulse.elapsed().as_secs_f32();
         egui::menu::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Options", |ui| {
                 if ui.button("Settings…").clicked() {
@@ -114,13 +120,23 @@ impl App {
                 }
             });
             ui.separator();
-            let color = match snap.mode {
+            let base = match snap.mode {
                 Mode::Idle => egui::Color32::GRAY,
                 Mode::Starting => egui::Color32::YELLOW,
                 Mode::Broadcasting => ACCENT,
                 Mode::Watching => egui::Color32::from_rgb(90, 160, 255),
             };
-            ui.colored_label(color, format!("● {}", snap.mode.status()));
+            // The dot breathes only while live; `Starting` stays calm yellow and
+            // `Idle` flat gray, so a steady dot never reads as a running session.
+            let pulsing = matches!(snap.mode, Mode::Broadcasting | Mode::Watching);
+            let dot = if pulsing {
+                base.gamma_multiply(pulse_factor(secs))
+            } else {
+                base
+            };
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.colored_label(dot, "●");
+            ui.colored_label(base, snap.mode.status());
             if let Some(err) = &snap.error {
                 ui.colored_label(egui::Color32::from_rgb(220, 90, 90), truncate(err, 60));
             }
@@ -298,6 +314,22 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// The status-dot breath: a shallow ~2-second pulse, brightness bounded to
+/// `0.6..=1.0` of the base colour so "live" reads at a glance without blinking
+/// out. Mirrors the viewers cell in the broadcast tab.
+fn pulse_factor(secs: f32) -> f32 {
+    0.6 + 0.4 * (0.5 + 0.5 * (secs * std::f32::consts::TAU * 0.5).cos())
+}
+
+/// The copy-box click flash: a linear fade from `1.0` to `0.0` over `window`,
+/// clamped outside it. Drives a brief brighten of the box fill and glyph.
+fn flash_alpha(elapsed: Duration, window: Duration) -> f32 {
+    if window.is_zero() {
+        return 0.0;
+    }
+    (1.0 - elapsed.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0)
 }
 
 /// Install the app's tuned dark theme once, before the first frame.
@@ -521,7 +553,9 @@ mod tests {
         {
             let mut g = app.state.lock().unwrap();
             g.mode = Mode::Broadcasting;
-            g.ticket = Some("endpointad…reused".into());
+            // A realistically long ticket: the copy box must elide it so it neither
+            // runs off the box nor past the window edge.
+            g.ticket = Some("b".repeat(140));
             g.stats = Some(StreamStats {
                 viewers: 3,
                 ..Default::default()
@@ -541,6 +575,23 @@ mod tests {
                 "painted rect {:?} escapes the window",
                 shape.clip_rect
             );
+        }
+
+        // Text extents (not just clip rects) stay inside the window: a long ticket
+        // is elided, so no glyph run spills past the right edge. `clip_rect` is the
+        // enclosing panel clip and would pass even if the galley overflowed, so the
+        // galley's own width is checked here — the regression the copy box had.
+        for shape in &with_toast {
+            if let egui::epaint::Shape::Text(t) = &shape.shape {
+                let right = t.pos.x + t.galley.rect.width();
+                assert!(
+                    right <= min.x + 1.0,
+                    "text {:?} (x={:.0}, w={:.0}) runs past the window edge",
+                    t.galley.text().chars().take(12).collect::<String>(),
+                    t.pos.x,
+                    t.galley.rect.width()
+                );
+            }
         }
 
         // The toast contributes its own painting on top of the tab.
@@ -627,5 +678,83 @@ mod tests {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hell…");
         assert_eq!(truncate("hello world", 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn pulse_factor_peaks_and_troughs_within_bounds() {
+        assert!((pulse_factor(0.0) - 1.0).abs() < 1e-6, "peak at t=0");
+        assert!((pulse_factor(1.0) - 0.6).abs() < 1e-6, "trough at t=1");
+        let mut secs = 0.0;
+        while secs <= 4.0 {
+            let f = pulse_factor(secs);
+            assert!(
+                (0.6..=1.0).contains(&f),
+                "pulse_factor({secs}) = {f} outside 0.6..=1.0"
+            );
+            secs += 0.1;
+        }
+    }
+
+    #[test]
+    fn flash_alpha_fades_linearly() {
+        assert_eq!(flash_alpha(Duration::ZERO, FLASH), 1.0);
+        assert_eq!(flash_alpha(FLASH, FLASH), 0.0);
+        assert_eq!(
+            flash_alpha(FLASH * 2, FLASH),
+            0.0,
+            "clamped past the window"
+        );
+        let half = flash_alpha(FLASH / 2, FLASH);
+        assert!(half > 0.0 && half < 1.0, "mid-window is between 0 and 1");
+        assert!(
+            flash_alpha(Duration::from_millis(100), FLASH)
+                > flash_alpha(Duration::from_millis(200), FLASH),
+            "monotonically decreasing"
+        );
+    }
+
+    /// Count the interactive rects on the Watch tab that are the size of the
+    /// "Watch Stream" button (its `min_size` is 160×30; nothing else on the tab is
+    /// ~30 tall). `interactive_rects_last_pass` filters out disabled widgets, so a
+    /// blank ticket — which disables the button — yields zero.
+    ///
+    /// The faint "paste a ticket to begin" hint is *not* counted: egui registers
+    /// hover-sense rects for plain labels too, so a naive total count would tie
+    /// (disabled button out, hint in). Filtering by the button's height isolates
+    /// the button and makes the gating observable.
+    fn watch_button_rects(ticket: &str) -> usize {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        app.watch_ticket = ticket.to_string();
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(760.0, 560.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(raw.clone(), |ui| app.draw(ui));
+            out.textures_delta.clear();
+        }
+        ctx.interactive_rects_last_pass()
+            .iter()
+            .filter(|r| (28.0..=32.0).contains(&r.height()))
+            .count()
+    }
+
+    #[test]
+    fn a_blank_ticket_disables_the_watch_button() {
+        assert_eq!(
+            watch_button_rects("abc"),
+            1,
+            "a real ticket shows one interactive Watch button"
+        );
+        assert_eq!(
+            watch_button_rects("   "),
+            0,
+            "a blank ticket disables the Watch button, dropping it from the set"
+        );
     }
 }
