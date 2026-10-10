@@ -58,8 +58,8 @@ use tokio::{
 
 use crate::{
     rtp::{
-        self, Codec, ParameterSets, Reorder, RtpInfo, TAG_AUDIO, TAG_EPOCH, TAG_FRAGMENT,
-        TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO, reorder_timeout_for,
+        self, reorder_timeout_for, Codec, ParameterSets, Reorder, RtpInfo, TAG_AUDIO, TAG_EPOCH,
+        TAG_FRAGMENT, TAG_KEYFRAME_REQ, TAG_SESSION, TAG_VIDEO,
     },
     sdp::{self, MediaHeader, MediaKind, OfferMedia, SessionHeader},
     whip::{self, Answer, WhipRequest},
@@ -1620,16 +1620,18 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         let required = packet.len().min(BURST_CAP);
                         loop {
                             let now = tokio::time::Instant::now();
-                            let elapsed = now.duration_since(last_fill).as_millis() as usize;
-                            if elapsed > 0 {
-                                tokens = (tokens + elapsed * TOKEN_RATE).min(BURST_CAP);
+                            let elapsed_micros = now.duration_since(last_fill).as_micros() as u64;
+                            if elapsed_micros > 0 {
+                                let added =
+                                    ((elapsed_micros * (TOKEN_RATE as u64)) / 1000) as usize;
+                                tokens = (tokens + added).min(BURST_CAP);
                                 last_fill = now;
                             }
                             if tokens >= required {
                                 tokens -= required;
                                 break;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                            tokio::task::yield_now().await;
                         }
                         forward(
                             &forward_video,

@@ -174,7 +174,8 @@ impl Reassembler {
 
     /// Drop entries that timed out.
     fn evict(&mut self, now: Instant) {
-        self.pending.retain(|_, e| now.duration_since(e.at) < FRAG_TIMEOUT);
+        self.pending
+            .retain(|_, e| now.duration_since(e.at) < FRAG_TIMEOUT);
     }
 
     /// Drop the oldest entry to make room for a new one.
@@ -358,7 +359,8 @@ impl Reorder {
     /// Release all held packets in sequence order, abandoning the holes.
     fn flush(&mut self, out: &mut Vec<Vec<u8>>) {
         let next = self.next.unwrap_or(0);
-        self.held.sort_by_key(|(s, _, _)| s.wrapping_sub(next) as i16);
+        self.held
+            .sort_by_key(|(s, _, _)| s.wrapping_sub(next) as i16);
         for (s, _, p) in self.held.drain(..) {
             self.next = Some(s.wrapping_add(1));
             out.push(p);
@@ -844,7 +846,10 @@ mod tests {
         let mut r = Reassembler::default();
         let now = Instant::now();
         assert!(r.push(&frags[0], now).is_none());
-        assert!(r.push(&frags[2], now).is_none(), "the last fragment is still missing");
+        assert!(
+            r.push(&frags[2], now).is_none(),
+            "the last fragment is still missing"
+        );
         assert_eq!(r.push(&frags[1], now).expect("complete"), original);
     }
 
@@ -861,11 +866,18 @@ mod tests {
         // out of order and interleaved with another datagram, with a dupe
         assert!(r.push(&other_frags[0], now).is_none());
         assert!(r.push(&frags[2], now).is_none());
-        assert!(r.push(&frags[2], now).is_none(), "a dupe is not complete twice");
+        assert!(
+            r.push(&frags[2], now).is_none(),
+            "a dupe is not complete twice"
+        );
         assert!(r.push(&other_frags[1], now).is_none());
         assert!(r.push(&frags[0], now).is_none());
         assert_eq!(r.push(&frags[1], now).expect("complete"), original);
-        assert_eq!(r.push(&other_frags[1], now), None, "the dupe completed nothing");
+        assert_eq!(
+            r.push(&other_frags[1], now),
+            None,
+            "the dupe completed nothing"
+        );
         assert_eq!(r.push(&other_frags[2], now).expect("complete"), other);
     }
 
@@ -952,7 +964,10 @@ mod tests {
         assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
         assert!(r.push(3, vec![3], t0).is_empty());
         // the hole at 2 is abandoned after the timeout
-        assert_eq!(r.push(4, vec![4], t0 + REORDER_TIMEOUT), vec![vec![3], vec![4]]);
+        assert_eq!(
+            r.push(4, vec![4], t0 + REORDER_TIMEOUT),
+            vec![vec![3], vec![4]]
+        );
         // the very late 2 is passed through so a downstream buffer can reorder
         assert_eq!(r.push(2, vec![2], t0 + REORDER_TIMEOUT), vec![vec![2]]);
     }
@@ -1001,7 +1016,9 @@ mod tests {
         assert_eq!(r.push(1, vec![1], t0), vec![vec![1]]);
         assert!(r.push(3, vec![3], t0).is_empty());
         // still held at 80ms: the default window would have flushed by now.
-        assert!(r.push(4, vec![4], t0 + Duration::from_millis(80)).is_empty());
+        assert!(r
+            .push(4, vec![4], t0 + Duration::from_millis(80))
+            .is_empty());
         // flushed once past the longer, custom window.
         assert_eq!(
             r.push(5, vec![5], t0 + Duration::from_millis(200)),
