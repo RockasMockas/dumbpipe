@@ -74,22 +74,16 @@ pub struct Config {
     pub bearer_token: Option<String>,
     /// The verbosity level (0-3) used for the log panel at startup.
     pub verbosity: u8,
-    /// The broadcast ticket, kept stable across restarts.
+    /// The most recently issued broadcast ticket, remembered across restarts.
     ///
-    /// An iroh ticket embeds the endpoint's per-session transport addresses, so
-    /// the string naturally changes every run. We persist it and re-display the
-    /// stored string (see [`crate::gui::state::reuse_ticket`]) so a ticket a
-    /// friend saved keeps working as a stable handle; the endpoint identity is
-    /// stable via [`Config::secret_hex`], and relays route by that identity, so
-    /// the stale addresses in a reused ticket are a fallback, not a requirement.
+    /// Stored for reference only. It is *not* re-advertised as the live ticket on
+    /// the next broadcast: that ticket is always freshly minted from the live
+    /// endpoint address (see [`crate::gui::state::spawn_broadcast`]) so viewers get
+    /// current transport hints and can hole-punch direct instead of falling back to
+    /// a slow, lossy relay path. The endpoint identity stays stable via
+    /// [`Config::secret_hex`], so an older ticket a friend saved still resolves to
+    /// this endpoint — it just carries stale addresses and may route via a relay.
     pub broadcast_ticket: Option<String>,
-    /// The WHIP host [`Config::broadcast_ticket`] was issued for.
-    ///
-    /// Stored trimmed, matching how it is compared at broadcast start, so a host
-    /// typed with stray whitespace still counts as unchanged.
-    pub broadcast_ticket_host: String,
-    /// The WHIP port [`Config::broadcast_ticket`] was issued for.
-    pub broadcast_ticket_port: u16,
 }
 
 /// Optional per-player binary paths.
@@ -141,8 +135,6 @@ impl Default for Config {
             bearer_token: None,
             verbosity: 1,
             broadcast_ticket: None,
-            broadcast_ticket_host: "127.0.0.1".to_string(),
-            broadcast_ticket_port: 8080,
         }
     }
 }
@@ -326,25 +318,23 @@ mod tests {
     fn broadcast_ticket_round_trips() {
         let cfg = Config {
             broadcast_ticket: Some("ticket-body".into()),
-            broadcast_ticket_host: "0.0.0.0".into(),
-            broadcast_ticket_port: 9001,
             ..Config::default()
         };
         let back = serde_json::from_str::<Config>(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.broadcast_ticket.as_deref(), Some("ticket-body"));
-        assert_eq!(back.broadcast_ticket_host, "0.0.0.0");
-        assert_eq!(back.broadcast_ticket_port, 9001);
     }
 
     #[test]
     fn old_config_without_ticket_fields_still_loads() {
         // A config written before the broadcast ticket was persisted must load with
         // sensible defaults rather than failing (struct-level `serde(default)`).
-        let back = serde_json::from_str::<Config>("{\"broadcast_port\":9001}").unwrap();
+        // A config that still carries the now-removed `broadcast_ticket_host` /
+        // `broadcast_ticket_port` keys must also load: struct-level `serde(default)`
+        // ignores unknown fields.
+        let back =
+            serde_json::from_str::<Config>("{\"broadcast_port\":9001,\"broadcast_ticket_host\":\"0.0.0.0\",\"broadcast_ticket_port\":9001}").unwrap();
         assert_eq!(back.broadcast_port, 9001);
         assert!(back.broadcast_ticket.is_none());
-        assert_eq!(back.broadcast_ticket_host, "127.0.0.1");
-        assert_eq!(back.broadcast_ticket_port, 8080);
     }
 
     #[test]

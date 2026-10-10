@@ -16,7 +16,6 @@
 
 use std::{
     path::PathBuf,
-    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -26,7 +25,7 @@ use dumbpipe::{
     EndpointTicket, WEBRTC_ALPN,
 };
 use eframe::egui;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle, time::timeout};
 
 use crate::{udp, CommonArgs, ONLINE_TIMEOUT};
@@ -185,49 +184,14 @@ pub struct BroadcastParams {
     pub url: String,
     /// The bearer token OBS must present, if any.
     pub bearer_token: Option<String>,
-    /// The persisted broadcast ticket to re-display, if any.
-    pub persisted_ticket: Option<String>,
-    /// Whether the WHIP host and port are unchanged since `persisted_ticket` was
-    /// issued. Both sides of this comparison use the trimmed host.
-    pub host_port_ok: bool,
-}
-
-/// Decide whether to re-display a persisted broadcast ticket, or mint a new one.
-///
-/// Two gates, in order:
-///
-/// 1. **Host/port rule.** The ticket stays put unless the WHIP ingest endpoint
-///    moves, so a changed host or port means a new ticket.
-/// 2. **Identity guard.** The ticket must have been issued for *this* endpoint.
-///    `broadcast_host`/`broadcast_port` persist independently of `secret_hex`, so
-///    a changed identity (`IROH_SECRET` set, or a regenerated secret) alongside an
-///    unchanged host/port would otherwise re-advertise a ticket pointing at a dead
-///    [`EndpointId`] that no viewer can ever reach.
-///
-/// A reused ticket carries the per-session transport addresses of the run that
-/// minted it, which are stale by then. It still connects because relays forward
-/// encrypted traffic keyed on the stable [`EndpointId`], and the viewer's address
-/// lookup re-resolves live addresses once the stale ones are unreachable.
-pub fn reuse_ticket(
-    persisted: Option<String>,
-    host_port_ok: bool,
-    current_id: EndpointId,
-) -> Option<String> {
-    if !host_port_ok {
-        return None;
-    }
-    let ticket = persisted?;
-    EndpointTicket::from_str(&ticket)
-        .ok()
-        .filter(|tk| tk.endpoint_addr().id == current_id)
-        .map(|_| ticket)
 }
 
 /// Start a broadcast session, returning its task handle to store in the state.
 ///
 /// Sets the mode to `Starting` synchronously, then brings the endpoint online,
-/// decides which ticket to display (see [`reuse_ticket`]) and runs
-/// [`webrtc::listen_whip`] until it returns or is aborted.
+/// mints a fresh ticket from the live endpoint address (exactly like the CLI
+/// `listen-whip`) and runs [`webrtc::listen_whip`] until it returns or is
+/// aborted.
 pub fn spawn_broadcast(
     state: Arc<Mutex<SharedState>>,
     handle: Handle,
@@ -253,12 +217,18 @@ pub fn spawn_broadcast(
             tracing::warn!("failed to connect to the home relay");
         }
         let addr = endpoint.addr();
-        let fresh = EndpointTicket::new(addr).to_string();
-        // Log the live ticket every session. If a reused ticket ever fails to
-        // connect, this is the string that would have worked.
-        tracing::debug!("fresh ticket for this session: {fresh}");
-        let shown = reuse_ticket(params.persisted_ticket, params.host_port_ok, endpoint.id())
-            .unwrap_or(fresh);
+        // Always mint the ticket from the *live* endpoint address, like the CLI.
+        // The ticket embeds the endpoint's current relay and public socket hints,
+        // so a viewer dialing it can hole-punch direct instead of falling back to
+        // a far relay — which the player reports as a lossy "long-distance path"
+        // with missed RTP packets and H.264 decode errors. Re-displaying a
+        // persisted ticket here was the bug: its transport addresses go stale the
+        // moment the NAT mapping or relay changes. The endpoint identity stays
+        // stable via the persisted secret, so an *older* ticket a friend saved
+        // still resolves to this endpoint — it just carries stale hints and may
+        // route slowly through a relay.
+        let shown = EndpointTicket::new(addr).to_string();
+        tracing::debug!("fresh ticket for this session: {shown}");
         let listen = match udp::resolve(&params.listen) {
             Ok(listen) => listen,
             Err(e) => {
@@ -405,70 +375,6 @@ pub async fn consume_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Mint a ticket string for a given identity, the way `spawn_broadcast` does
-    /// with a live endpoint.
-    fn ticket_for(secret: &SecretKey) -> String {
-        EndpointTicket::new(EndpointAddr::new(secret.public())).to_string()
-    }
-
-    #[test]
-    fn reuses_ticket_when_host_port_and_identity_match() {
-        let secret = SecretKey::generate();
-        let persisted = ticket_for(&secret);
-        assert_eq!(
-            reuse_ticket(Some(persisted.clone()), true, secret.public()).as_deref(),
-            Some(persisted.as_str()),
-            "an unchanged host, port and identity must re-display the same ticket"
-        );
-    }
-
-    #[test]
-    fn mints_new_ticket_when_host_or_port_changed() {
-        let secret = SecretKey::generate();
-        let persisted = ticket_for(&secret);
-        assert_eq!(
-            reuse_ticket(Some(persisted), false, secret.public()),
-            None,
-            "the ticket moves when the ingest endpoint moves"
-        );
-    }
-
-    #[test]
-    fn mints_new_ticket_when_identity_changed() {
-        // The host/port gate alone is not enough. `broadcast_host`/`broadcast_port`
-        // persist independently of `secret_hex`, so a changed identity with an
-        // unchanged host/port would otherwise re-advertise a ticket pointing at a
-        // dead `EndpointId` that no viewer can ever reach.
-        let old = SecretKey::generate();
-        let new = SecretKey::generate();
-        let persisted = ticket_for(&old);
-        assert_eq!(
-            reuse_ticket(Some(persisted), true, new.public()),
-            None,
-            "a ticket from a different identity is never reused"
-        );
-    }
-
-    #[test]
-    fn mints_new_ticket_when_nothing_persisted() {
-        let secret = SecretKey::generate();
-        assert_eq!(reuse_ticket(None, true, secret.public()), None);
-    }
-
-    #[test]
-    fn mints_new_ticket_when_persisted_ticket_is_unparsable() {
-        // A hand-edited or truncated config must not surface a broken ticket.
-        let secret = SecretKey::generate();
-        assert_eq!(
-            reuse_ticket(
-                Some("definitely-not-a-ticket".into()),
-                true,
-                secret.public()
-            ),
-            None
-        );
-    }
 
     /// Regression (AC1): `spawn_watch` used to set `Watching` synchronously, so
     /// the Watch tab claimed "playing in a player window" the instant the button

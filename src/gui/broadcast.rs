@@ -133,11 +133,12 @@ impl App {
             let ticket = snap.ticket.clone().unwrap_or_else(|| "…".into());
             self.copy_box(ui, "ticket", &ticket);
 
-            // Persist the ticket we are actually showing, together with the host
-            // and port it was issued for, so it survives restarts. Guarded to
-            // `broadcasting` (a stopped session must not re-advertise a stale
-            // ticket) and to a real change (so we never rewrite config.json every
-            // frame).
+            // Remember the ticket we are actually showing, so the most recent
+            // broadcast survives restarts (for reference / history). This is *not*
+            // re-advertised as the live ticket on the next broadcast — that is
+            // always freshly minted from the live endpoint address so viewers get
+            // current transport hints. Guarded to a real change so we never
+            // rewrite config.json every frame.
             let changed = snap
                 .ticket
                 .as_ref()
@@ -145,8 +146,6 @@ impl App {
                 .unwrap_or(false);
             if changed {
                 self.config.broadcast_ticket = snap.ticket.clone();
-                self.config.broadcast_ticket_host = self.config.broadcast_host.trim().to_string();
-                self.config.broadcast_ticket_port = self.config.broadcast_port;
                 self.config.save();
             }
 
@@ -279,11 +278,6 @@ impl App {
         let url = state::whip_url(&host, port);
         let listen = format!("{host}:{port}");
         let bearer_token = self.config.bearer_token();
-        // The ticket is only supposed to move when the ingest endpoint moves, so
-        // gate reuse on the same trimmed host the session will serve on (the raw
-        // host may carry whitespace the user typed).
-        let host_port_ok =
-            host == self.config.broadcast_ticket_host && port == self.config.broadcast_ticket_port;
         self.config.save();
 
         let handle = state::spawn_broadcast(
@@ -294,8 +288,6 @@ impl App {
                 listen,
                 url,
                 bearer_token,
-                persisted_ticket: self.config.broadcast_ticket.clone(),
-                host_port_ok,
             },
             self.stats_tx.clone(),
         );
