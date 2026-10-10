@@ -68,6 +68,21 @@ impl App {
                 if requested {
                     self.reset_ticket(ui.ctx());
                 }
+
+                ui.add_space(4.0);
+                // Verbosity picker: one line, three mutually exclusive levels
+                // (1 = quiet, 2 = info, 3 = debug). Defaults to level 1. Applied to
+                // the log panel on the next launch, since logging is installed once
+                // at startup.
+                ui.horizontal(|ui| {
+                    ui.label("Log Verbosity");
+                    for level in 1..=3u8 {
+                        if ui.radio(self.config.verbosity == level, format!("Level {level}")).clicked() {
+                            self.config.verbosity = level;
+                            self.config.save();
+                        }
+                    }
+                });
             });
 
         ui.add_space(4.0);
