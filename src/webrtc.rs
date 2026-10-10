@@ -1,7 +1,7 @@
 //! WebRTC ingest and playback over an iroh connection.
 //!
 //! Neither mpv nor VLC is a WebRTC client: they have no ICE, no DTLS and no
-//! way to negotiate a stream. Dumbpipe therefore terminates WebRTC on both
+//! way to negotiate a stream. Streampipe therefore terminates WebRTC on both
 //! ends and hands the viewer plain RTP plus a generated SDP file:
 //!
 //! ```text
@@ -557,6 +557,27 @@ enum ViewerEvent {
 /// Identifier assigned to the next viewer.
 static NEXT_VIEWER: AtomicU64 = AtomicU64::new(1);
 
+/// A snapshot of the live host statistics, sent to the GUI over a channel.
+///
+/// The CLI never receives these (its `stats_tx` is `None`), so its stderr
+/// output is unchanged. The GUI renders this in its statistics panel. Rates
+/// are the average over the last reporting interval; `viewers` is the live
+/// count and is refreshed immediately when a viewer joins or leaves, so the
+/// count does not flicker to a stale value between the periodic ticks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamStats {
+    /// Seconds since the broadcast session started.
+    pub elapsed_secs: u64,
+    /// Number of viewers currently connected.
+    pub viewers: usize,
+    /// Video bitrate of the last interval in kbit/s (0 when no video arrived).
+    pub video_kbps: f64,
+    /// Audio bitrate of the last interval in kbit/s (0 when no audio arrived).
+    pub audio_kbps: f64,
+    /// Video frame rate of the last interval (0 when no video arrived).
+    pub video_fps: f64,
+}
+
 /// Configuration of the WHIP host.
 pub struct WhipConfig {
     /// The HTTP address to serve WHIP on.
@@ -567,6 +588,10 @@ pub struct WhipConfig {
     pub ice_addr: Option<SocketAddr>,
     /// Whether to log periodic counters.
     pub stats: bool,
+    /// Optional channel for structured live statistics (used by the GUI).
+    ///
+    /// `None` for the CLI, which keeps its log-only behaviour.
+    pub stats_tx: Option<mpsc::UnboundedSender<StreamStats>>,
 }
 
 /// Listen for a WHIP stream from OBS and forward it to connecting viewers.
@@ -586,7 +611,7 @@ pub async fn listen_whip(endpoint: Endpoint, cfg: WhipConfig) -> Result<()> {
 
     let http = whip::serve(cfg.listen, cfg.bearer_token.clone(), req_tx);
     let accept = accept_viewers(endpoint.clone(), viewer_tx);
-    let host = host_loop(ice, ice_addr, req_rx, viewer_rx, cfg.stats);
+    let host = host_loop(ice, ice_addr, req_rx, viewer_rx, cfg.stats, cfg.stats_tx);
 
     let result = tokio::select! {
         res = http => res,
@@ -874,10 +899,26 @@ struct Host {
     seen: Vec<MediaKind>,
     /// Whether to log periodic counters.
     stats: bool,
+    /// When the host session started, for the elapsed time in the stats panel.
+    started_at: Instant,
+    /// The last non-zero video bitrate, reused on viewer join/leave so the GUI
+    /// bitrate does not flicker to zero between periodic ticks.
+    last_video_kbps: f64,
+    /// The last non-zero audio bitrate, reused on viewer join/leave.
+    last_audio_kbps: f64,
+    /// The last non-zero video fps, reused on viewer join/leave.
+    last_video_fps: f64,
+    /// Optional channel for structured live statistics (used by the GUI).
+    stats_tx: Option<mpsc::UnboundedSender<StreamStats>>,
 }
 
 impl Host {
-    fn new(ice: Arc<UdpSocket>, ice_addr: SocketAddr, stats: bool) -> Self {
+    fn new(
+        ice: Arc<UdpSocket>,
+        ice_addr: SocketAddr,
+        stats: bool,
+        stats_tx: Option<mpsc::UnboundedSender<StreamStats>>,
+    ) -> Self {
         Host {
             rtc: new_rtc(),
             ice,
@@ -896,6 +937,11 @@ impl Host {
             report: StreamReport::new(Instant::now()),
             seen: Vec::new(),
             stats,
+            started_at: Instant::now(),
+            last_video_kbps: 0.0,
+            last_audio_kbps: 0.0,
+            last_video_fps: 0.0,
+            stats_tx,
         }
     }
 
@@ -946,6 +992,7 @@ impl Host {
                 );
                 self.refresh_header(true);
                 self.request_keyframe();
+                self.send_cached_stats();
             }
             ViewerEvent::Keyframe { id } => {
                 // A viewer asks for a keyframe when it starts its player, when
@@ -967,6 +1014,7 @@ impl Host {
                     count = self.viewers.len()
                 );
                 tracing::info!("viewer {id} left");
+                self.send_cached_stats();
             }
         }
     }
@@ -1240,7 +1288,68 @@ impl Host {
 
     /// Print the periodic media report of the last interval.
     fn report_media(&mut self) {
-        self.report.log(Instant::now(), self.viewers.len());
+        let now = Instant::now();
+        // Compute the rates of the interval that `log` is about to report and
+        // reset, before the tallies are cleared. Silence reports as zero.
+        let v_secs = now
+            .duration_since(self.report.video.since)
+            .as_secs_f64()
+            .max(0.001);
+        let (video_kbps, video_fps) = if self.report.video.active() {
+            (
+                self.report.video.kbit_per_second(now),
+                self.report.video.frames as f64 / v_secs,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let audio_kbps = if self.report.audio.active() {
+            self.report.audio.kbit_per_second(now)
+        } else {
+            0.0
+        };
+        // Unchanged CLI log: prints the periodic line and restarts the tallies.
+        self.report.log(now, self.viewers.len());
+        // Cache the last non-zero rates so a viewer join/leave can refresh the
+        // viewer count without zeroing the bitrate between ticks.
+        if video_kbps > 0.0 {
+            self.last_video_kbps = video_kbps;
+        }
+        if video_fps > 0.0 {
+            self.last_video_fps = video_fps;
+        }
+        if audio_kbps > 0.0 {
+            self.last_audio_kbps = audio_kbps;
+        }
+        self.send_stats(now, video_kbps, video_fps, audio_kbps);
+    }
+
+    /// Send a structured stats snapshot to the GUI, if a channel is wired up.
+    ///
+    /// The CLI passes no channel, so this is a no-op there.
+    fn send_stats(&self, now: Instant, video_kbps: f64, video_fps: f64, audio_kbps: f64) {
+        if let Some(tx) = &self.stats_tx {
+            let _ = tx.send(StreamStats {
+                elapsed_secs: now.duration_since(self.started_at).as_secs(),
+                viewers: self.viewers.len(),
+                video_kbps,
+                video_fps,
+                audio_kbps,
+            });
+        }
+    }
+
+    /// Refresh the viewer count for the GUI using the last known rates, so a
+    /// join or leave updates the count immediately without flicking the bitrate
+    /// to zero.
+    fn send_cached_stats(&self) {
+        let now = Instant::now();
+        self.send_stats(
+            now,
+            self.last_video_kbps,
+            self.last_video_fps,
+            self.last_audio_kbps,
+        );
     }
 
     /// Ask the publisher for a keyframe.
@@ -1374,8 +1483,9 @@ async fn host_loop(
     mut req_rx: mpsc::Receiver<WhipRequest>,
     mut viewer_rx: mpsc::Receiver<ViewerEvent>,
     stats: bool,
+    stats_tx: Option<mpsc::UnboundedSender<StreamStats>>,
 ) -> Result<()> {
-    let mut host = Host::new(ice.clone(), ice_addr, stats);
+    let mut host = Host::new(ice.clone(), ice_addr, stats, stats_tx);
     let mut header_tick = interval(HEADER_INTERVAL);
     header_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut stats_tick = interval(STATS_INTERVAL);
@@ -1980,6 +2090,10 @@ async fn wait_until_listening(port: u16) {
 /// nothing. Only a sustained gap with no keyframe for [`KF_REQUEST_INTERVAL`]
 /// sends a PLI: on a lossy path nearly every frame has a gap, and a PLI per gap
 /// turns into a keyframe storm that amplifies the loss instead of recovering.
+// Pre-existing: this forwarder threads a handful of per-viewer state pointers
+// through the hot path. Left as-is to avoid churn in the media forwarding code;
+// the argument count is not worth a struct refactor.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     socket: &Arc<UdpSocket>,
     packet: &[u8],
@@ -2116,7 +2230,7 @@ mod tests {
     async fn host() -> Host {
         let ice = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ice_addr = ice.local_addr().unwrap();
-        Host::new(ice, ice_addr, false)
+        Host::new(ice, ice_addr, false, None)
     }
 
     fn viewer(host: &mut Host) -> mpsc::Receiver<Frame> {
@@ -2535,7 +2649,7 @@ mod tests {
 
         let ice = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ice_addr = ice.local_addr().unwrap();
-        let mut host = Host::new(ice.clone(), ice_addr, false);
+        let mut host = Host::new(ice.clone(), ice_addr, false, None);
         let (tx, mut rx) = mpsc::channel(256);
         host.on_viewer_event(ViewerEvent::Joined {
             id: 1,

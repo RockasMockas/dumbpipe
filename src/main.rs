@@ -1,4 +1,5 @@
 //! Command line arguments.
+mod gui;
 mod udp;
 
 use std::{
@@ -45,7 +46,7 @@ const COPY_BUF: usize = 8 * 1024;
 /// One side listens, the other side connects. Both sides are identified by a
 /// 32 byte endpoint id.
 ///
-/// Connecting to a endpoint id is independent of its IP address. Dumbpipe will try
+/// Connecting to a endpoint id is independent of its IP address. Streampipe will try
 /// to establish a direct connection even through NATs and firewalls. If that
 /// fails, it will fall back to using a relay server.
 ///
@@ -65,7 +66,7 @@ pub enum Commands {
     /// Generate a short endpoint ticket. This ticket can be used to later connect to a
     /// listener that is using the same secret key again.
     ///
-    /// This command only really makes sense when you are providing dumbpipe with a
+    /// This command only really makes sense when you are providing streampipe with a
     /// secret key.
     GenerateTicket,
 
@@ -128,7 +129,7 @@ pub enum Commands {
     /// Will print a endpoint ticket on stderr that a viewer can connect with.
     ///
     /// As far as the endpoint is concerned, this is listening. But it is also
-    /// serving HTTP, which is where OBS posts its SDP offer. Dumbpipe terminates
+    /// serving HTTP, which is where OBS posts its SDP offer. Streampipe terminates
     /// WebRTC (ICE, DTLS, SRTP) here, because neither mpv nor VLC can do it,
     /// and forwards the media as plain RTP to the viewers.
     ///
@@ -209,7 +210,7 @@ pub struct CommonArgs {
 
     /// A custom ALPN to use for the endpoint.
     ///
-    /// This is an expert feature that allows dumbpipe to be used to interact
+    /// This is an expert feature that allows streampipe to be used to interact
     /// with existing iroh protocols.
     ///
     /// When using this option, the connect side must also specify the same ALPN.
@@ -761,9 +762,9 @@ async fn listen_stdio(args: ListenArgs) -> Result<()> {
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
     // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Listening. To connect, use:\ndumbpipe connect {ticket}");
+    eprintln!("Listening. To connect, use:\nstreampipe connect {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect {short}");
+        eprintln!("or:\nstreampipe connect {short}");
     }
     tracing::info!("waiting for connections");
 
@@ -955,9 +956,9 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     // note that the tests rely on the ticket being the last thing printed
     eprintln!("Forwarding incoming requests to '{}'.", args.host);
     eprintln!("To connect, use e.g.:");
-    eprintln!("dumbpipe connect-tcp {ticket}");
+    eprintln!("streampipe connect-tcp {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-tcp {short}");
+        eprintln!("or:\nstreampipe connect-tcp {short}");
     }
     tracing::info!("waiting for connections");
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
@@ -1051,9 +1052,9 @@ async fn listen_udp(args: ListenUdpArgs) -> Result<()> {
     // note that the tests rely on the ticket being the last thing printed
     eprintln!("Forwarding incoming datagrams to udp://{target}.");
     eprintln!("To connect, use e.g.:");
-    eprintln!("dumbpipe connect-udp --addr 127.0.0.1:9000 {ticket}");
+    eprintln!("streampipe connect-udp --addr 127.0.0.1:9000 {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-udp --addr 127.0.0.1:9000 {short}");
+        eprintln!("or:\nstreampipe connect-udp --addr 127.0.0.1:9000 {short}");
     }
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
     tracing::info!(
@@ -1222,7 +1223,7 @@ fn create_short_ticket(addr: &EndpointAddr) -> EndpointTicket {
 
 /// Serve WHIP on a local HTTP address and forward the media to viewers.
 ///
-/// OBS posts its SDP offer to `http://<listen>/whip`, dumbpipe terminates the
+/// OBS posts its SDP offer to `http://<listen>/whip`, streampipe terminates the
 /// WebRTC session and forwards the media as plain RTP over iroh. Every viewer
 /// that dials in gets the stream from the next keyframe.
 async fn listen_whip(args: ListenWhipArgs) -> Result<()> {
@@ -1244,9 +1245,9 @@ async fn listen_whip(args: ListenWhipArgs) -> Result<()> {
     eprintln!("Serving WHIP input on http://{listen}/whip.");
     eprintln!("Use that as the server URL of the WHIP output in OBS.");
     eprintln!("To watch the stream, connect with e.g.:");
-    eprintln!("dumbpipe connect-whip {ticket}");
+    eprintln!("streampipe connect-whip {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-whip {short}");
+        eprintln!("or:\nstreampipe connect-whip {short}");
     }
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
     tracing::debug!(
@@ -1260,6 +1261,7 @@ async fn listen_whip(args: ListenWhipArgs) -> Result<()> {
         bearer_token: args.bearer_token.clone(),
         ice_addr: args.ice_addr,
         stats: stats_enabled(args.common.verbosity()),
+        stats_tx: None,
     };
     webrtc::listen_whip(endpoint, cfg).await
 }
@@ -1344,11 +1346,11 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         socket_path.display()
     );
     eprintln!("To connect, use e.g.:");
-    eprintln!("dumbpipe connect-unix --socket-path /path/to/client.sock {ticket}");
-    eprintln!("dumbpipe connect-tcp --addr 127.0.0.1:8080 {ticket}");
+    eprintln!("streampipe connect-unix --socket-path /path/to/client.sock {ticket}");
+    eprintln!("streampipe connect-tcp --addr 127.0.0.1:8080 {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-unix --socket-path /path/to/client.sock {short}");
-        eprintln!("dumbpipe connect-tcp --addr 127.0.0.1:8080 {short}");
+        eprintln!("or:\nstreampipe connect-unix --socket-path /path/to/client.sock {short}");
+        eprintln!("streampipe connect-tcp --addr 127.0.0.1:8080 {short}");
     }
     tracing::info!("waiting for connections");
     tracing::info!("endpoint id is {}", ticket.endpoint_addr().id);
@@ -1554,11 +1556,13 @@ async fn generate_ticket() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    init_logging(args.command.common());
-    let res = match args.command {
+/// Run the CLI subcommand described by `args` on the current runtime.
+///
+/// Extracted from `main` so that the GUI can share the process: when the
+/// binary is launched with no arguments we open the GUI instead of parsing
+/// subcommands, but every CLI path runs exactly this body.
+async fn run_cli(args: Args) -> Result<()> {
+    match args.command {
         Commands::GenerateTicket => generate_ticket().await,
         Commands::Listen(args) => listen_stdio(args).await,
         Commands::ListenTcp(args) => listen_tcp(args).await,
@@ -1574,14 +1578,32 @@ async fn main() -> Result<()> {
 
         #[cfg(unix)]
         Commands::ConnectUnix(args) => connect_unix(args).await,
-    };
-    match res {
+    }
+}
+
+fn main() -> Result<()> {
+    // Launched with no arguments at all: open the GUI. Any flag or subcommand
+    // (including `--help`, `--version` and an unknown subcommand) keeps the
+    // CLI behaviour byte-for-byte, and clap still exits non-zero on a parse
+    // error.
+    if std::env::args_os().count() == 1 {
+        gui::run();
+        return Ok(());
+    }
+
+    let args = Args::parse();
+    init_logging(args.command.common());
+
+    // A multi-threaded runtime, matching the old `#[tokio::main]`, so the CLI
+    // behaves exactly as before.
+    let runtime = tokio::runtime::Runtime::new().std_context("unable to start runtime")?;
+    match runtime.block_on(run_cli(args)) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // `Display` prints only the outer error.  Include its sources so
             // connection failures report Iroh's actionable cause as well.
             eprintln!("error: {e:#}");
-            std::process::exit(1)
+            std::process::exit(1);
         }
     }
 }

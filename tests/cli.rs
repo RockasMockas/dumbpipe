@@ -12,7 +12,7 @@ use rand::RngExt;
 
 // binary path
 fn dumbpipe_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_dumbpipe")
+    env!("CARGO_BIN_EXE_streampipe")
 }
 
 /// Read `n` lines from `reader`, returning the bytes read including the newlines.

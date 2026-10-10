@@ -39,7 +39,7 @@ on:
         default: ""
 
 env:
-  BIN_NAME: dumbpipe
+  BIN_NAME: streampipe
   IROH_FORCE_STAGING_RELAYS: "1"
 
 # Default to read-only; jobs that need more grant it explicitly.
