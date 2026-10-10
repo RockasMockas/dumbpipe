@@ -15,6 +15,7 @@
 //! reuse and only dropped when the app quits.
 
 use std::{
+    net::{SocketAddrV4, SocketAddrV6},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -60,6 +61,24 @@ impl Mode {
     }
 }
 
+/// Optional fixed bind addresses for the endpoint, mirroring the CLI's
+/// `--ipv4-addr` / `--ipv6-addr`.
+///
+/// Empty by default, so the endpoint binds an ephemeral port and the ticket
+/// changes every session (the normal, hole-punched case). When a streamer has a
+/// static public IP and sets a fixed `ip:port` here, the endpoint binds that exact
+/// socket, the ticket's direct addresses stop churning, and the ticket stays byte
+/// stable across sessions — useful when a friend saved the ticket and you want it to
+/// keep working unchanged. It is opt-in: leaving it blank keeps the default
+/// ephemeral behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BindAddrs {
+    /// The IPv4 socket to bind, if fixed.
+    pub ipv4: Option<SocketAddrV4>,
+    /// The IPv6 socket to bind, if fixed.
+    pub ipv6: Option<SocketAddrV6>,
+}
+
 /// The cross-thread state shared by the UI thread, the stats consumer task and
 /// the engine session task.
 #[derive(Debug)]
@@ -68,6 +87,10 @@ pub struct SharedState {
     secret: SecretKey,
     /// The shared endpoint, created lazily and reused across sessions.
     endpoint: Option<Endpoint>,
+    /// The bind addresses the cached endpoint was bound with, so a change to the
+    /// configured bind addresses forces a rebind rather than silently reusing an
+    /// endpoint on the old (ephemeral) socket.
+    bind: BindAddrs,
     /// The running engine task, if any.
     pub(crate) session: Option<JoinHandle<()>>,
     /// The current mode.
@@ -88,6 +111,7 @@ impl SharedState {
         SharedState {
             secret,
             endpoint: None,
+            bind: BindAddrs::default(),
             session: None,
             mode: Mode::Idle,
             stats: None,
@@ -141,8 +165,14 @@ pub fn whip_url(host: &str, port: u16) -> String {
 /// session would flash to `Broadcasting` and straight back to `Idle` with no
 /// error. Drop it and bind a fresh one instead; the identity is unchanged (same
 /// secret), so a persisted ticket still points at this endpoint.
-async fn ensure_endpoint(state: &Arc<Mutex<SharedState>>) -> crate::Result<Endpoint> {
-    let cached = state.lock().unwrap().endpoint.clone();
+async fn ensure_endpoint(
+    state: &Arc<Mutex<SharedState>>,
+    bind: BindAddrs,
+) -> crate::Result<Endpoint> {
+    let cached = {
+        let g = state.lock().unwrap();
+        g.endpoint.clone().filter(|_| g.bind == bind)
+    };
     if let Some(endpoint) = cached {
         if !endpoint.is_closed() {
             return Ok(endpoint);
@@ -151,8 +181,8 @@ async fn ensure_endpoint(state: &Arc<Mutex<SharedState>>) -> crate::Result<Endpo
     }
     let secret = state.lock().unwrap().secret.clone();
     let common = CommonArgs {
-        ipv4_addr: None,
-        ipv6_addr: None,
+        ipv4_addr: bind.ipv4,
+        ipv6_addr: bind.ipv6,
         custom_alpn: None,
         // Verbose enough to log the endpoint lifecycle to the log panel.
         verbose: 1,
@@ -160,7 +190,9 @@ async fn ensure_endpoint(state: &Arc<Mutex<SharedState>>) -> crate::Result<Endpo
     };
     let alpn = crate::webrtc_alpn(&common)?;
     let endpoint = crate::create_endpoint(secret, &common, vec![alpn]).await?;
-    state.lock().unwrap().endpoint = Some(endpoint.clone());
+    let mut g = state.lock().unwrap();
+    g.endpoint = Some(endpoint.clone());
+    g.bind = bind;
     Ok(endpoint)
 }
 
@@ -184,6 +216,9 @@ pub struct BroadcastParams {
     pub url: String,
     /// The bearer token OBS must present, if any.
     pub bearer_token: Option<String>,
+    /// Optional fixed bind addresses, so a streamer with a static IP can keep the
+    /// ticket stable. Empty by default.
+    pub bind: BindAddrs,
 }
 
 /// Start a broadcast session, returning its task handle to store in the state.
@@ -209,7 +244,7 @@ pub fn spawn_broadcast(
     }
     ctx.request_repaint();
     handle.spawn(async move {
-        let endpoint = match ensure_endpoint(&state).await {
+        let endpoint = match ensure_endpoint(&state, params.bind).await {
             Ok(endpoint) => endpoint,
             Err(e) => return fail(&state, &ctx, format!("could not bind endpoint: {e:#}")),
         };
@@ -297,7 +332,7 @@ pub fn spawn_watch(
     }
     ctx.request_repaint();
     handle.spawn(async move {
-        let endpoint = match ensure_endpoint(&state).await {
+        let endpoint = match ensure_endpoint(&state, BindAddrs::default()).await {
             Ok(endpoint) => endpoint,
             Err(e) => return fail(&state, &ctx, format!("could not bind endpoint: {e:#}")),
         };
@@ -430,9 +465,13 @@ mod tests {
             whip_url("127.0.0.1", 8080),
         )));
 
-        let first = ensure_endpoint(&state).await.expect("bind");
+        let first = ensure_endpoint(&state, BindAddrs::default())
+            .await
+            .expect("bind");
         // While open, the same endpoint is reused across calls.
-        let reused = ensure_endpoint(&state).await.expect("reuse");
+        let reused = ensure_endpoint(&state, BindAddrs::default())
+            .await
+            .expect("reuse");
         assert!(!reused.is_closed());
 
         // `listen_whip` closes the endpoint it was handed when it returns.
@@ -440,7 +479,9 @@ mod tests {
         assert!(first.is_closed());
 
         // The next session must get a fresh, live endpoint, not the dead one.
-        let fresh = ensure_endpoint(&state).await.expect("rebind");
+        let fresh = ensure_endpoint(&state, BindAddrs::default())
+            .await
+            .expect("rebind");
         assert!(
             !fresh.is_closed(),
             "a closed endpoint must be replaced with a live one"
@@ -448,5 +489,40 @@ mod tests {
         // Identity is stable across the rebind (same secret), so a persisted
         // ticket still resolves to this endpoint.
         assert_eq!(fresh.id(), reused.id());
+    }
+
+    /// A live endpoint is reused only while the requested bind addresses match; a
+    /// changed bind must rebind so the ticket carries the new fixed socket.
+    #[tokio::test]
+    async fn a_changed_bind_forces_a_rebind() {
+        let state = Arc::new(Mutex::new(SharedState::new(
+            SecretKey::generate(),
+            whip_url("127.0.0.1", 8080),
+        )));
+
+        let ephemeral = ensure_endpoint(&state, BindAddrs::default())
+            .await
+            .expect("bind ephemeral");
+        assert!(!ephemeral.is_closed());
+
+        // Same (empty) bind reuses the live endpoint.
+        let reused = ensure_endpoint(&state, BindAddrs::default())
+            .await
+            .expect("reuse");
+        assert_eq!(reused.id(), ephemeral.id());
+
+        // A fixed IPv4 bind on loopback differs from empty → rebind.
+        let fixed = BindAddrs {
+            ipv4: Some("127.0.0.1:0".parse().unwrap()),
+            ipv6: None,
+        };
+        let rebound = ensure_endpoint(&state, fixed).await.expect("rebind");
+        assert!(!rebound.is_closed());
+        // Identity unchanged (same secret); only the socket differs.
+        assert_eq!(rebound.id(), ephemeral.id());
+        // The requested bind is remembered, so the next identical request reuses.
+        assert_eq!(state.lock().unwrap().bind, fixed);
+        let reused_fixed = ensure_endpoint(&state, fixed).await.expect("reuse fixed");
+        assert_eq!(reused_fixed.id(), rebound.id());
     }
 }

@@ -84,6 +84,13 @@ pub struct Config {
     /// [`Config::secret_hex`], so an older ticket a friend saved still resolves to
     /// this endpoint — it just carries stale addresses and may route via a relay.
     pub broadcast_ticket: Option<String>,
+    /// Optional fixed IPv4 bind address (`ip:port`) for the broadcast endpoint.
+    ///
+    /// Empty by default (ephemeral port, ticket changes each session). A streamer
+    /// with a static public IP can set this to keep the ticket stable.
+    pub broadcast_bind_ipv4: Option<String>,
+    /// Optional fixed IPv6 bind address (`[ip]:port`) for the broadcast endpoint.
+    pub broadcast_bind_ipv6: Option<String>,
 }
 
 /// Optional per-player binary paths.
@@ -135,6 +142,8 @@ impl Default for Config {
             bearer_token: None,
             verbosity: 1,
             broadcast_ticket: None,
+            broadcast_bind_ipv4: None,
+            broadcast_bind_ipv6: None,
         }
     }
 }
@@ -322,6 +331,28 @@ mod tests {
         };
         let back = serde_json::from_str::<Config>(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.broadcast_ticket.as_deref(), Some("ticket-body"));
+    }
+
+    #[test]
+    fn bind_addrs_round_trip_and_default_to_none() {
+        let cfg = Config {
+            broadcast_bind_ipv4: Some("203.0.113.7:45678".into()),
+            broadcast_bind_ipv6: Some("[2001:db8::1]:45678".into()),
+            ..Config::default()
+        };
+        let back = serde_json::from_str::<Config>(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            back.broadcast_bind_ipv4.as_deref(),
+            Some("203.0.113.7:45678")
+        );
+        assert_eq!(
+            back.broadcast_bind_ipv6.as_deref(),
+            Some("[2001:db8::1]:45678")
+        );
+        // An old config without the keys defaults them to ephemeral.
+        let old = serde_json::from_str::<Config>("{}").unwrap();
+        assert!(old.broadcast_bind_ipv4.is_none());
+        assert!(old.broadcast_bind_ipv6.is_none());
     }
 
     #[test]

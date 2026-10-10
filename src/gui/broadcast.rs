@@ -1,13 +1,17 @@
 //! The Start Broadcasting tab: WHIP host/port/token, a start button, then the
 //! click-to-copy WHIP URL and ticket plus live statistics.
 
-use std::time::Instant;
+use std::{
+    net::{SocketAddrV4, SocketAddrV6},
+    time::Instant,
+};
 
 use eframe::egui::{self, Context, Ui};
 
 use super::{
+    config::Config,
     flash_alpha,
-    state::{self, BroadcastParams, Mode},
+    state::{self, BindAddrs, BroadcastParams, Mode},
     App, ACCENT, FLASH,
 };
 
@@ -58,6 +62,50 @@ impl App {
                                 None
                             } else {
                                 Some(token)
+                            };
+                        }
+                        ui.end_row();
+
+                        // Optional fixed bind sockets. Empty (the default) binds an
+                        // ephemeral port and the ticket changes each session. A
+                        // streamer with a static public IP can pin `ip:port` here so
+                        // the ticket stays byte stable across sessions.
+                        ui.label("Bind IPv4:");
+                        let mut v4 = self
+                            .config
+                            .broadcast_bind_ipv4
+                            .clone()
+                            .unwrap_or_default();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut v4)
+                                .hint_text("e.g. 203.0.113.7:45678")
+                                .desired_width(180.0),
+                        );
+                        if resp.changed() {
+                            self.config.broadcast_bind_ipv4 = if v4.trim().is_empty() {
+                                None
+                            } else {
+                                Some(v4)
+                            };
+                        }
+                        ui.end_row();
+
+                        ui.label("Bind IPv6:");
+                        let mut v6 = self
+                            .config
+                            .broadcast_bind_ipv6
+                            .clone()
+                            .unwrap_or_default();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut v6)
+                                .hint_text("e.g. [2001:db8::1]:45678")
+                                .desired_width(180.0),
+                        );
+                        if resp.changed() {
+                            self.config.broadcast_bind_ipv6 = if v6.trim().is_empty() {
+                                None
+                            } else {
+                                Some(v6)
                             };
                         }
                         ui.end_row();
@@ -278,6 +326,19 @@ impl App {
         let url = state::whip_url(&host, port);
         let listen = format!("{host}:{port}");
         let bearer_token = self.config.bearer_token();
+
+        // Parse the optional fixed bind addresses. Empty means ephemeral; a bad
+        // value is surfaced to the UI rather than silently ignored, so a typo does
+        // not quietly fall back to an ephemeral socket and a changing ticket.
+        let bind = match parse_bind(&self.config) {
+            Ok(bind) => bind,
+            Err(e) => {
+                self.state.lock().unwrap().error = Some(e);
+                ctx.request_repaint();
+                return;
+            }
+        };
+
         self.config.save();
 
         let handle = state::spawn_broadcast(
@@ -288,11 +349,33 @@ impl App {
                 listen,
                 url,
                 bearer_token,
+                bind,
             },
             self.stats_tx.clone(),
         );
         self.state.lock().unwrap().session = Some(handle);
     }
+}
+
+/// Parse the configured fixed bind addresses, `None`/empty meaning ephemeral.
+///
+/// IPv4 is parsed as `ip:port`; IPv6 as `[ip]:port` (the brackets are optional, so
+/// a bare `::1:45678` is rejected in favour of the explicit `[::1]:45678` form,
+/// matching `SocketAddrV6`'s expected syntax).
+fn parse_bind(config: &Config) -> Result<BindAddrs, String> {
+    let ipv4 = match config.broadcast_bind_ipv4.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(s.parse::<SocketAddrV4>().map_err(|e| {
+            format!("invalid Bind IPv4 {s:?}: {e} (expected ip:port)")
+        })?),
+        _ => None,
+    };
+    let ipv6 = match config.broadcast_bind_ipv6.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(s.parse::<SocketAddrV6>().map_err(|e| {
+            format!("invalid Bind IPv6 {s:?}: {e} (expected [ip]:port)")
+        })?),
+        _ => None,
+    };
+    Ok(BindAddrs { ipv4, ipv6 })
 }
 
 /// The Viewers cell: a large count with a status dot.
@@ -376,6 +459,41 @@ fn format_elapsed(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty bind fields mean ephemeral (no fixed socket, ticket changes each run).
+    #[test]
+    fn parse_bind_empty_is_ephemeral() {
+        let bind = parse_bind(&Config::default()).unwrap();
+        assert_eq!(bind, BindAddrs::default());
+    }
+
+    /// A fixed IPv4/IPv6 bind parses through and would pin the ticket's socket.
+    #[test]
+    fn parse_bind_accepts_fixed_addresses() {
+        let cfg = Config {
+            broadcast_bind_ipv4: Some(" 203.0.113.7:45678 ".into()),
+            broadcast_bind_ipv6: Some("[2001:db8::1]:45678".into()),
+            ..Config::default()
+        };
+        let bind = parse_bind(&cfg).unwrap();
+        assert_eq!(
+            bind,
+            BindAddrs {
+                ipv4: Some("203.0.113.7:45678".parse().unwrap()),
+                ipv6: Some("[2001:db8::1]:45678".parse().unwrap()),
+            }
+        );
+    }
+
+    /// A malformed bind is surfaced as an error, not silently dropped to ephemeral.
+    #[test]
+    fn parse_bind_rejects_malformed() {
+        let cfg = Config {
+            broadcast_bind_ipv4: Some("not-an-address".into()),
+            ..Config::default()
+        };
+        assert!(parse_bind(&cfg).is_err());
+    }
 
     /// The copy glyph's two sheets sit inside the box, are non-degenerate, and the
     /// front reads up-right of the back. Guards against a misplaced or absent glyph
