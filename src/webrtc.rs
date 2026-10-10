@@ -189,6 +189,11 @@ impl Player {
                     }
                 }
                 cmd.extend([
+                    // Enlarge the UDP/RTP receive socket buffer so a brief decode
+                    // hiccup at high bitrate does not overflow the kernel default
+                    // (~200 KB) and silently drop inbound RTP.
+                    "-buffer_size".into(),
+                    "4194304".into(),
                     "-probesize".into(),
                     "1000000".into(),
                     "-analyzeduration".into(),
@@ -1044,7 +1049,7 @@ impl Host {
 
     fn send_all(&self, frame: Frame) {
         for viewer in &self.viewers {
-            try_send(&viewer.tx, &frame);
+            try_send(&viewer.tx, &frame, &self.counters);
         }
     }
 
@@ -1122,6 +1127,7 @@ impl Host {
                 try_send(
                     &viewer.tx,
                     &Frame::Header(Bytes::from(self.header.encode())),
+                    &self.counters,
                 );
             }
             // Tag every keyframe with an epoch, not just the one that opens the
@@ -1129,9 +1135,9 @@ impl Host {
             // does not look like a gap) and to pace its keyframe requests, which
             // keeps a lossy path from poking the encoder with a PLI per frame.
             if keyframe {
-                try_send(&viewer.tx, &Frame::Epoch);
+                try_send(&viewer.tx, &Frame::Epoch, &self.counters);
             }
-            try_send(&viewer.tx, &frame);
+            try_send(&viewer.tx, &frame, &self.counters);
         }
         if opened > 0 {
             tracing::info!("opened the gate for {opened} viewer(s) at a keyframe");
@@ -1305,8 +1311,12 @@ fn frame_len(frame: &Frame) -> usize {
 }
 
 /// Send a frame to a viewer, dropping it if the viewer is too slow.
-fn try_send(tx: &mpsc::Sender<Frame>, frame: &Frame) {
+///
+/// A full queue is egress loss: count it as undeliverable so a slow or
+/// overloaded viewer is visible in the stats instead of only in `trace!`.
+fn try_send(tx: &mpsc::Sender<Frame>, frame: &Frame, counters: &Counters) {
     if tx.try_send(clone_frame(frame)).is_err() {
+        counters.undeliverable.fetch_add(1, Ordering::Relaxed);
         tracing::trace!("viewer queue full, dropped a frame");
     }
 }
@@ -1454,6 +1464,21 @@ struct PlayerHandle {
     stop: mpsc::Sender<()>,
 }
 
+/// A message from the viewer's QUIC read loop to its forwarding task.
+///
+/// The read loop never blocks on the localhost UDP send: it pushes packets to
+/// a bounded channel and a dedicated task drains them to the player. A full
+/// channel drops the packet, which reads as ordinary RTP loss and triggers a
+/// throttled keyframe request, instead of the read loop parking on `send_to`
+/// and dumping the QUIC backlog at the player in one burst.
+enum ForwardMsg {
+    /// A keyframe epoch: reset the gap-detection baseline in the forward task.
+    Epoch,
+    /// An RTP packet to forward: its player port, the bytes, and whether it is
+    /// video (video drives gap detection and keyframe requests).
+    Packet(u16, Vec<u8>, bool),
+}
+
 /// Connect to a WHIP host and play the stream out locally.
 ///
 /// The viewer is a plain RTP forwarder: it announces the local video port, then
@@ -1529,8 +1554,6 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
 
         let mut header: Option<SessionHeader> = None;
         let mut forwarding = false;
-        let mut last_seq: Option<u16> = None;
-        let mut last_kf: Option<Instant> = None;
         // Datagrams the host had to fragment, reassembled before they are
         // forwarded to the player.
         let mut reassembler = rtp::Reassembler::default();
@@ -1544,6 +1567,48 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
         let reorder_timeout = reorder_timeout_for(cfg.buffer);
         let mut video_order = Reorder::with_timeout(reorder_timeout);
         let mut audio_order = Reorder::with_timeout(reorder_timeout);
+
+        // Decouple the QUIC read loop from the localhost UDP send. The read
+        // loop pushes packets onto this bounded channel and never waits for the
+        // player; a dedicated task drains it to ffplay. If the player hiccups
+        // the channel fills and packets drop (counted as undeliverable), which
+        // reads as ordinary RTP loss and triggers a throttled keyframe request,
+        // instead of the read loop parking on send_to and releasing the QUIC
+        // backlog at the player in one burst.
+        let (forward_tx, mut forward_rx) = mpsc::channel::<ForwardMsg>(VIEWER_QUEUE);
+        let forward_video = video.clone();
+        let forward_counters = counters.clone();
+        let forward_kf_tx = kf_tx.clone();
+        let forward_task = tokio::spawn(async move {
+            // Gap detection and keyframe pacing live here, driven by the order
+            // packets are actually written to the player.
+            let mut last_seq: Option<u16> = None;
+            let mut last_kf: Option<Instant> = None;
+            while let Some(msg) = forward_rx.recv().await {
+                match msg {
+                    ForwardMsg::Epoch => {
+                        // A keyframe just arrived: reset the baseline so the gap
+                        // right after it is not mistaken for a loss.
+                        last_seq = None;
+                        last_kf = Some(Instant::now());
+                    }
+                    ForwardMsg::Packet(port, packet, is_video) => {
+                        forward(
+                            &forward_video,
+                            &packet,
+                            port,
+                            &forward_counters,
+                            &mut last_seq,
+                            &mut last_kf,
+                            is_video,
+                            &forward_kf_tx,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
         let mut last_packet = tokio::time::Instant::now();
         let mut wait_tick = interval(WAIT_INTERVAL);
         wait_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1597,11 +1662,12 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         Some(TAG_EPOCH) => {
                             if header.as_ref().is_some_and(|h| h.has_media()) {
                                 forwarding = true;
-                                last_seq = None;
-                                // A keyframe just arrived: it is the newest decoder
-                                // refresh, so a gap right after it is not a loss and
-                                // we must not poke the encoder because of it.
-                                last_kf = Some(Instant::now());
+                                // Tell the forward task to reset its gap baseline:
+                                // a gap right after this keyframe is not a loss and
+                                // must not poke the encoder.
+                                if forward_tx.try_send(ForwardMsg::Epoch).is_err() {
+                                    counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                                }
                                 // fragments and out-of-order packets of the old GOP
                                 // are dead now; reset the sequence baseline too
                                 reassembler.clear();
@@ -1625,7 +1691,12 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                                 None => vec![packet.to_vec()],
                             };
                             for pkt in emit {
-                                forward(&video, &pkt, port, &counters, &mut last_seq, &mut last_kf, is_video, &kf_tx).await;
+                                if forward_tx
+                                    .try_send(ForwardMsg::Packet(port, pkt, is_video))
+                                    .is_err()
+                                {
+                                    counters.undeliverable.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             last_packet = tokio::time::Instant::now();
                         }
@@ -1655,6 +1726,9 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             }
         };
 
+        // Stop the forward task before closing the connection so it cannot leak
+        // across a reconnect.
+        forward_task.abort();
         counters.log_final();
         if let Some(player) = player.take() {
             let _ = player.stop.send(()).await;
