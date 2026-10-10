@@ -8,7 +8,7 @@ use eframe::egui::{self, Context, Ui};
 use super::{
     config::{player_key, PLAYERS},
     state::{self, Mode, WatchParams},
-    truncate, App,
+    truncate, App, ACCENT,
 };
 
 /// Parse a buffer field (milliseconds) into an option; blank or invalid is
@@ -31,7 +31,8 @@ impl App {
                 ui.add_sized(
                     [ui.available_width(), 54.0],
                     egui::TextEdit::multiline(&mut self.watch_ticket)
-                        .hint_text("paste a ticket from a friend"),
+                        .hint_text("paste a ticket from a friend")
+                        .background_color(egui::Color32::from_rgba_unmultiplied(80, 200, 120, 14)),
                 )
             });
         });
@@ -100,7 +101,10 @@ impl App {
                     _ => "playing in a player window",
                 });
             } else {
-                let button = egui::Button::new("▶  Watch Stream").min_size(egui::vec2(160.0, 30.0));
+                let button = egui::Button::new("▶  Watch Stream")
+                    .min_size(egui::vec2(160.0, 30.0))
+                    .fill(ACCENT.gamma_multiply(0.18))
+                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
                 if ui.add_enabled(!busy, button).clicked() {
                     self.start_watch(ui.ctx());
                 }
@@ -137,8 +141,9 @@ impl App {
         let play_addr = self.config.play_addr.clone();
         let buffer_ms = parse_buffer_ms(&self.watch_buffer);
 
-        // Persist the last-used player, buffer and ticket.
-        self.config.default_player = player_key(self.watch_player).to_string();
+        // Persist the last-used buffer and ticket. The default player is owned by
+        // Options (it is the value auto-selected on the Watch tab at open), so a
+        // quick-switch here only affects this session and must not overwrite it.
         self.config.buffer_ms = buffer_ms;
         self.config.note_ticket(&ticket_text);
         self.config.save();

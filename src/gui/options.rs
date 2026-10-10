@@ -33,46 +33,54 @@ impl App {
 
     /// The two sections of the Options window.
     fn options_content(&mut self, ui: &mut Ui) {
+        // Host, port, token and verbosity are captured when a broadcast starts, so
+        // editing them mid-session is inert; grey them out while one is live. The
+        // owned snapshot drops its lock immediately, so the grid's `&mut self.config`
+        // borrows stay valid.
+        let active = super::state::snapshot(&self.state).mode.active();
         egui::CollapsingHeader::new("Streaming")
             .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new("opt_stream")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("WHIP host");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.broadcast_host)
-                                .desired_width(200.0),
-                        );
-                        ui.end_row();
+                ui.add_enabled_ui(!active, |ui| {
+                    egui::Grid::new("opt_stream")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("WHIP host");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.broadcast_host)
+                                    .desired_width(200.0),
+                            );
+                            ui.end_row();
 
-                        ui.label("WHIP port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.broadcast_port).range(1..=65535),
-                        );
-                        ui.end_row();
+                            ui.label("WHIP port");
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.broadcast_port)
+                                    .range(1..=65535),
+                            );
+                            ui.end_row();
 
-                        ui.label("Bearer token");
-                        let mut token = self.config.bearer_token.clone().unwrap_or_default();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut token)
-                                .hint_text("none")
-                                .desired_width(200.0),
-                        );
-                        if resp.changed() {
-                            self.config.bearer_token = if token.trim().is_empty() {
-                                None
-                            } else {
-                                Some(token)
-                            };
-                        }
-                        ui.end_row();
+                            ui.label("Bearer token");
+                            let mut token = self.config.bearer_token.clone().unwrap_or_default();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut token)
+                                    .hint_text("none")
+                                    .desired_width(200.0),
+                            );
+                            if resp.changed() {
+                                self.config.bearer_token = if token.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(token)
+                                };
+                            }
+                            ui.end_row();
 
-                        ui.label("Verbosity");
-                        ui.add(egui::DragValue::new(&mut self.config.verbosity).range(0..=3));
-                        ui.end_row();
-                    });
+                            ui.label("Verbosity");
+                            ui.add(egui::DragValue::new(&mut self.config.verbosity).range(0..=3));
+                            ui.end_row();
+                        });
+                });
                 ui.weak("Host, port and verbosity apply on the next start.");
             });
 

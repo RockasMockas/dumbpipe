@@ -69,14 +69,27 @@ impl App {
                     state::stop(&self.state, ui.ctx());
                     self.config.save();
                 }
-                ui.label(if starting {
-                    "starting…"
+                // Once OBS is in, swap the "waiting" hint for a live viewer count
+                // in the accent colour, so a healthy stream reads at a glance.
+                let viewers = snap.stats.map(|s| s.viewers).unwrap_or(0);
+                if starting {
+                    ui.label("starting…");
+                } else if viewers > 0 {
+                    ui.colored_label(
+                        ACCENT,
+                        format!(
+                            "{viewers} viewer{} live",
+                            if viewers == 1 { "" } else { "s" }
+                        ),
+                    );
                 } else {
-                    "waiting for OBS to connect"
-                });
+                    ui.label("waiting for OBS to connect");
+                }
             } else {
-                let button =
-                    egui::Button::new("●  Start Broadcasting").min_size(egui::vec2(180.0, 30.0));
+                let button = egui::Button::new("●  Start Broadcasting")
+                    .min_size(egui::vec2(180.0, 30.0))
+                    .fill(ACCENT.gamma_multiply(0.18))
+                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
                 if ui.add_enabled(!active, button).clicked() {
                     self.start_broadcast(ui.ctx());
                 }
@@ -126,35 +139,39 @@ impl App {
     /// pill, so it never reflows the surrounding layout. This widget owns the
     /// click and the hover affordance that advertises it.
     fn copy_box(&mut self, ui: &mut Ui, key: &'static str, text: &str) {
-        let frame = egui::Frame::group(ui.style());
+        // A faint accent tint reads the box as an interactive input surface. The
+        // whole frame is the click target (not just the glyphs), so the copy
+        // affordance is easy to hit and the tinted padding never feels dead.
+        let frame = egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgba_unmultiplied(80, 200, 120, 14))
+            .inner_margin(egui::Margin::symmetric(10, 6));
         let inner = frame.show(ui, |ui| {
             let width = ui.available_width();
-            let label =
-                egui::Label::new(egui::RichText::new(text).monospace()).sense(egui::Sense::click());
-            ui.add_sized([width, 22.0], label)
+            ui.add_sized(
+                [width, 22.0],
+                egui::Label::new(egui::RichText::new(text).monospace()),
+            );
         });
-        // The click lives on the label; the frame's own response only senses hover,
-        // so hover is read from the label and painted onto the frame rect using the
-        // frame's own corner radius. `on_hover_text` consumes the response, so the
-        // interactions are read off it first.
-        let label = inner.inner;
-        let clicked = label.clicked();
-        let hovered = label.hovered();
-        label.on_hover_text("click to copy");
-        if clicked {
-            ui.ctx().copy_text(text.to_string());
-            self.copied = Some((key, Instant::now()));
-            ui.ctx().request_repaint();
-        }
-        if hovered {
+        // Sense the click over the frame's full rect so the padding is live too.
+        // `on_hover_text` consumes the response, so interactions are read off it
+        // before it is handed to the tooltip.
+        let rect = inner.response.rect;
+        let resp = ui.interact(rect, ui.id().with(("copy", key)), egui::Sense::click());
+        if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             ui.painter().rect_stroke(
-                inner.response.rect,
+                rect,
                 frame.corner_radius,
                 egui::Stroke::new(1.0, ui.style().visuals.selection.stroke.color),
                 egui::StrokeKind::Inside,
             );
         }
+        if resp.clicked() {
+            ui.ctx().copy_text(text.to_string());
+            self.copied = Some((key, Instant::now()));
+            ui.ctx().request_repaint();
+        }
+        resp.on_hover_text("click to copy");
     }
 
     /// The live statistics panel: viewers, bitrate, fps, elapsed.
@@ -171,18 +188,23 @@ impl App {
                     ui.end_row();
 
                     ui.label("Video");
-                    ui.strong(format!(
-                        "{:.0} kbit/s · {:.1} fps",
-                        stats.video_kbps, stats.video_fps
-                    ));
+                    ui.strong(
+                        egui::RichText::new(format!(
+                            "{:.0} kbit/s · {:.1} fps",
+                            stats.video_kbps, stats.video_fps
+                        ))
+                        .monospace(),
+                    );
                     ui.end_row();
 
                     ui.label("Audio");
-                    ui.strong(format!("{:.0} kbit/s", stats.audio_kbps));
+                    ui.strong(
+                        egui::RichText::new(format!("{:.0} kbit/s", stats.audio_kbps)).monospace(),
+                    );
                     ui.end_row();
 
                     ui.label("Elapsed");
-                    ui.strong(format_elapsed(stats.elapsed_secs));
+                    ui.strong(egui::RichText::new(format_elapsed(stats.elapsed_secs)).monospace());
                     ui.end_row();
                 });
         });

@@ -129,22 +129,33 @@ impl App {
 
     /// The tab strip.
     fn tab_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("streampipe");
-            ui.add_space(12.0);
-            if ui
-                .selectable_label(self.tab == Tab::Watch, "Watch Stream")
-                .clicked()
-            {
-                self.tab = Tab::Watch;
-            }
-            if ui
-                .selectable_label(self.tab == Tab::Broadcast, "Start Broadcasting")
-                .clicked()
-            {
-                self.tab = Tab::Broadcast;
-            }
-        });
+        let (watch, bc) = ui
+            .horizontal(|ui| {
+                ui.heading("streampipe");
+                ui.add_space(12.0);
+                let w = ui.selectable_label(self.tab == Tab::Watch, "Watch Stream");
+                let b = ui.selectable_label(self.tab == Tab::Broadcast, "Start Broadcasting");
+                if w.clicked() {
+                    self.tab = Tab::Watch;
+                }
+                if b.clicked() {
+                    self.tab = Tab::Broadcast;
+                }
+                (w, b)
+            })
+            .inner;
+        // A persistent accent underline marks the active tab, so selection is
+        // legible even when the selectable_label background is subtle.
+        let active_rect = if self.tab == Tab::Watch {
+            watch.rect
+        } else {
+            bc.rect
+        };
+        let underline = egui::Rect::from_min_max(
+            active_rect.left_bottom() - egui::vec2(0.0, 2.0),
+            active_rect.right_bottom(),
+        );
+        ui.painter().rect_filled(underline, 0.0, ACCENT);
         ui.separator();
     }
 
@@ -240,14 +251,19 @@ impl App {
             self.options_window(ui.ctx());
         }
         self.log_panel(ui);
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.tab_bar(ui);
-            ui.add_space(8.0);
-            match self.tab {
-                Tab::Watch => self.watch_tab(ui),
-                Tab::Broadcast => self.broadcast_tab(ui),
-            }
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ui, |ui| {
+                self.tab_bar(ui);
+                ui.add_space(8.0);
+                match self.tab {
+                    Tab::Watch => self.watch_tab(ui),
+                    Tab::Broadcast => self.broadcast_tab(ui),
+                }
+            });
         // Drawn last, on its own foreground layer, so it floats over the panels
         // without taking part in their layout.
         self.toast_overlay(ui);
@@ -282,6 +298,41 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// Install the app's tuned dark theme once, before the first frame.
+///
+/// egui ships an OS-following stock palette; this pins a deliberate dark look
+/// with an accent-tinted selection/hover so the app does not depend on the host
+/// OS theme. `all_styles_mut` retunes both the dark and light variants, so the
+/// palette stays coherent even if the theme preference is ever switched, while
+/// `set_theme` makes dark the deterministic default across platforms. Deltas are
+/// kept small: a slightly deeper neutral ground, an accent selection, and gentle
+/// widget and spacing bumps.
+fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|style| {
+        let v = &mut style.visuals;
+        // A touch deeper than egui's stock dark so panels read as deliberate.
+        v.panel_fill = egui::Color32::from_rgb(24, 26, 30);
+        v.window_fill = egui::Color32::from_rgb(30, 33, 38);
+        v.faint_bg_color = egui::Color32::from_rgb(38, 42, 48);
+        // Accent-tinted selection and hover, reused by the copy-box stroke.
+        v.selection.bg_fill = ACCENT.gamma_multiply(0.28);
+        v.selection.stroke.color = ACCENT;
+        // Nudge the interactive surfaces toward the accent without shouting.
+        v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(44, 48, 54);
+        v.widgets.inactive.bg_fill = egui::Color32::from_rgb(44, 48, 54);
+        v.widgets.hovered.weak_bg_fill = ACCENT.gamma_multiply(0.16);
+        v.widgets.hovered.bg_fill = ACCENT.gamma_multiply(0.16);
+        v.widgets.active.weak_bg_fill = ACCENT.gamma_multiply(0.30);
+        v.widgets.active.bg_fill = ACCENT.gamma_multiply(0.30);
+        // A little breathing room and softer corners.
+        style.spacing.item_spacing = egui::vec2(10.0, 7.0);
+        style.spacing.window_margin = egui::Margin::same(14);
+        v.window_corner_radius = egui::CornerRadius::same(8);
+        v.menu_corner_radius = egui::CornerRadius::same(8);
+    });
 }
 
 /// Open the GUI.
@@ -327,6 +378,7 @@ pub fn run() {
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
+            apply_theme(&ctx);
             handle.spawn(state::consume_stats(stats_rx, consumer_state, ctx));
             Ok(Box::new(app))
         }),
@@ -521,6 +573,45 @@ mod tests {
                 shape.clip_rect
             );
         }
+    }
+
+    /// Count the interactive rects the Options window registers with the given
+    /// mode, rendering only that window so the tab panels' own gating cannot
+    /// confound the comparison.
+    fn options_interactive_rects(mode: Mode) -> usize {
+        let (mut app, _rt) = test_app();
+        app.state.lock().unwrap().mode = mode;
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(760.0, 560.0),
+            )),
+            ..Default::default()
+        };
+        // A few passes so the window and its grid settle at their final size.
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                app.options_window(ui.ctx());
+            });
+            out.textures_delta.clear();
+        }
+        ctx.interactive_rects_last_pass().len()
+    }
+
+    /// Regression (AC3): the Options "Streaming" inputs must leave the interactive
+    /// set while a session is live and return to it when idle. `interactive_rects_last_pass`
+    /// filters out disabled widgets, so this count distinguishes disabled from enabled
+    /// where an in-bounds/no-crash render check would pass either way.
+    #[test]
+    fn options_streaming_fields_are_disabled_while_a_session_is_active() {
+        let idle = options_interactive_rects(Mode::Idle);
+        let broadcasting = options_interactive_rects(Mode::Broadcasting);
+        assert!(
+            broadcasting < idle,
+            "streaming fields should be non-interactive while broadcasting \
+             ({broadcasting} interactive rects vs {idle} idle)"
+        );
     }
 
     #[test]
