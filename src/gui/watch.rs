@@ -62,7 +62,7 @@ impl App {
         // stray newline Enter would otherwise insert into a multiline box.
         let textedit = egui::TextEdit::multiline(&mut self.watch_ticket)
             .id(ticket_id)
-            .hint_text("paste a ticket from a friend")
+            .hint_text("Paste stream ticket here to start watching broadcasted stream...")
             .return_key(None::<egui::KeyboardShortcut>)
             .frame(
                 egui::Frame::group(ui.style())
@@ -161,9 +161,6 @@ impl App {
                 .inner;
             if resp.clicked() {
                 self.start_watch(ui.ctx());
-            }
-            if !busy && self.watch_ticket.trim().is_empty() {
-                ui.weak("paste a ticket to begin");
             }
         }
 

@@ -211,7 +211,7 @@ impl App {
                     ),
                 );
             } else {
-                ui.label("waiting for OBS to connect");
+                ui.label("Waiting for OBS to start streaming to whip address...");
             }
             if ui
                 .add_sized([bw, 36.0], egui::Button::new("■  Stop Broadcasting"))

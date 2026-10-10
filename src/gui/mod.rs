@@ -336,6 +336,29 @@ impl App {
             self.config.save();
         }
 
+        // Global keyboard shortcuts, consumed here so egui's default focus
+        // traversal doesn't also fire on the same press. Ctrl/Cmd+, toggles the
+        // Settings overlay; while it's closed, Tab cycles the Watch/Broadcast tabs.
+        let ctx = ui.ctx();
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.show_options = !self.show_options;
+            ctx.request_repaint();
+        } else if !self.show_options
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            self.tab = match self.tab {
+                Tab::Watch => Tab::Broadcast,
+                Tab::Broadcast => Tab::Watch,
+            };
+            self.focus_primary = true;
+            // egui armed a focus traversal (`focus_direction = Next`) from this Tab
+            // press before `draw` ran, so cancelling it here stops the first widget
+            // (the menu-bar Settings button) from stealing keyboard focus and showing
+            // its focus ring. Tab now only switches tabs.
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            ctx.request_repaint();
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             self.menu_bar(ui);
         });
