@@ -156,12 +156,44 @@ impl App {
 
     /// The tab strip.
     fn tab_bar(&mut self, ui: &mut Ui) {
+        ui.heading("streampipe");
+        ui.add_space(6.0);
+        // Two equal-width tabs that fill the whole strip; the selectable label is
+        // sized to its half so the entire tab box (not just the text) is the click
+        // target.
+        let half = ui.available_width() / 2.0;
+        let tab_h = 32.0;
         let (watch, bc) = ui
             .horizontal(|ui| {
-                ui.heading("streampipe");
-                ui.add_space(12.0);
-                let w = ui.selectable_label(self.tab == Tab::Watch, "Watch Stream");
-                let b = ui.selectable_label(self.tab == Tab::Broadcast, "Start Broadcasting");
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // Style both states explicitly (rather than relying on `.selected()`,
+                // which only themes the active tab): the selected tab is a lighter
+                // surface with full-strength text (plus the accent underline below),
+                // while unselected tabs recede to a darker surface and dimmed text,
+                // keeping focus on the primary Start Broadcasting action.
+                let make = |ui: &mut Ui, label: &str, selected: bool| {
+                    let fill = if selected {
+                        egui::Color32::from_white_alpha(26)
+                    } else {
+                        egui::Color32::from_black_alpha(70)
+                    };
+                    let stroke = egui::Stroke::new(
+                        1.0,
+                        if selected {
+                            egui::Color32::from_white_alpha(45)
+                        } else {
+                            egui::Color32::from_white_alpha(10)
+                        },
+                    );
+                    let text = egui::RichText::new(label).color(if selected {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::GRAY
+                    });
+                    ui.add_sized([half, tab_h], egui::Button::new(text).fill(fill).stroke(stroke))
+                };
+                let w = make(ui, "Watch Stream", self.tab == Tab::Watch);
+                let b = make(ui, "Broadcast", self.tab == Tab::Broadcast);
                 if w.clicked() {
                     self.tab = Tab::Watch;
                     self.focus_primary = true;
