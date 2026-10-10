@@ -148,7 +148,7 @@ impl App {
             let w = (ui.available_width() - COPY_H_MARGIN * 2.0).max(0.0);
             self.copy_box(ui, "whip", &snap.whip_url, w);
             ui.add_space(6.0);
-            ui.strong("Send friends this ticket to watch:");
+            ui.strong("Send friends this stream ticket:");
             let ticket = snap.ticket.clone().unwrap_or_else(|| "…".into());
             let w = (ui.available_width() - COPY_H_MARGIN * 2.0).max(0.0);
             self.copy_box(ui, "ticket", &ticket, w);
@@ -173,7 +173,7 @@ impl App {
             self.stats_panel(ui, &snap);
         } else {
             ui.add_space(12.0);
-            ui.strong("Send friends this ticket to watch:");
+            ui.strong("Send friends this stream ticket:");
             let ticket = snap
                 .ticket
                 .clone()
