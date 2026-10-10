@@ -30,6 +30,8 @@ use self::{
 const REPAINT: Duration = Duration::from_millis(250);
 /// How long a "Copied" toast stays visible.
 const TOAST: Duration = Duration::from_millis(1500);
+/// The "live/success" accent: broadcasting status, the copy toast, and viewers.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 
 /// The two main tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,8 @@ pub struct App {
     watch_buffer: String,
     /// The last copied box and when, for the transient toast.
     copied: Option<(&'static str, Instant)>,
+    /// Clock origin for the viewers pulse, so it animates smoothly while live.
+    pulse: Instant,
 }
 
 impl App {
@@ -95,6 +99,7 @@ impl App {
             watch_player,
             watch_buffer,
             copied: None,
+            pulse: Instant::now(),
         }
     }
 
@@ -112,7 +117,7 @@ impl App {
             let color = match snap.mode {
                 Mode::Idle => egui::Color32::GRAY,
                 Mode::Starting => egui::Color32::YELLOW,
-                Mode::Broadcasting => egui::Color32::from_rgb(80, 200, 120),
+                Mode::Broadcasting => ACCENT,
                 Mode::Watching => egui::Color32::from_rgb(90, 160, 255),
             };
             ui.colored_label(color, format!("● {}", snap.mode.status()));
@@ -168,16 +173,53 @@ impl App {
         }
     }
 
-    /// Whether a "Copied" toast should show for `key`.
-    fn toast_active(&self, key: &str) -> bool {
-        self.copied
-            .map(|(k, at)| k == key && at.elapsed() < TOAST)
-            .unwrap_or(false)
+    /// The floating "Copied ✓" pill, anchored bottom-centre.
+    ///
+    /// Drawn in its own foreground [`egui::Area`] rather than inline, so confirming
+    /// a copy never nudges the WHIP URL box, the ticket box or the stats panel. The
+    /// repaint guard in [`App::draw`] keeps frames coming while it is up and expires
+    /// `copied` via [`expire_copied`], so the fade completes exactly as repaints
+    /// stop and no half-faded pill is left on screen.
+    fn toast_overlay(&self, ui: &Ui) {
+        // `App::ui` already expired `copied` for this frame, so if it is still set
+        // the toast is live; the expiry threshold lives in one place.
+        let Some((_, at)) = self.copied else {
+            return;
+        };
+        let elapsed = at.elapsed();
+        // Fade the whole pill out over its remaining lifetime.
+        let alpha = (1.0 - elapsed.as_secs_f32() / TOAST.as_secs_f32()).clamp(0.0, 1.0);
+        let frame = egui::Frame::popup(ui.style())
+            .fill(egui::Color32::from_rgb(30, 42, 36).gamma_multiply(alpha))
+            .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(alpha)))
+            .inner_margin(egui::Margin::symmetric(14, 6));
+        egui::Area::new(egui::Id::new("copy_toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                frame.show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Copied ✓")
+                            .strong()
+                            .color(ACCENT.gamma_multiply(alpha)),
+                    );
+                });
+            });
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+impl App {
+    /// Lay out the whole window.
+    ///
+    /// Split out of [`eframe::App::ui`], which only forwards here, so the real
+    /// frame can be driven headlessly by tests without a window or GL context.
+    fn draw(&mut self, ui: &mut Ui) {
+        // Expire the copy toast before deciding on the next frame. A click later in
+        // this same frame re-arms `copied` with a fresh `Instant`, so expiring here
+        // never races a click.
+        self.copied = expire_copied(self.copied, TOAST);
+
         let mode = self.state.lock().unwrap().mode;
         if mode.active() || self.copied.is_some() {
             ui.ctx().request_repaint_after(REPAINT);
@@ -206,7 +248,30 @@ impl eframe::App for App {
                 Tab::Broadcast => self.broadcast_tab(ui),
             }
         });
+        // Drawn last, on its own foreground layer, so it floats over the panels
+        // without taking part in their layout.
+        self.toast_overlay(ui);
     }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+/// Drop the copy toast once its window has closed.
+///
+/// `copied` is what arms the repaint guard in [`App::draw`] after a session has
+/// gone idle, so it has to expire: before the fix it was set on the first copy
+/// and never cleared, and the app asked for a repaint every tick forever.
+/// Extracted (with the window length injected) so that regression is testable
+/// without a live window.
+fn expire_copied(
+    copied: Option<(&'static str, Instant)>,
+    toast: Duration,
+) -> Option<(&'static str, Instant)> {
+    copied.filter(|(_, at)| at.elapsed() < toast)
 }
 
 /// Truncate a string to `max` chars, adding an ellipsis.
@@ -278,5 +343,198 @@ pub fn run() {
     if let Err(e) = result {
         eprintln!("error: gui failed: {e:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::SecretKey;
+
+    use super::*;
+
+    /// An `App` wired to throwaway state, plus the runtime it borrows a handle
+    /// from (kept alive by the caller).
+    fn test_app() -> (App, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = Config::default();
+        let whip = state::whip_url(&config.broadcast_host, config.broadcast_port);
+        let shared = Arc::new(Mutex::new(SharedState::new(SecretKey::generate(), whip)));
+        let (stats_tx, _stats_rx) = mpsc::unbounded_channel();
+        let app = App::new(
+            rt.handle().clone(),
+            config,
+            shared,
+            log::new_ring(),
+            stats_tx,
+        );
+        (app, rt)
+    }
+
+    /// Drive real frames of the UI headlessly and report the repaint delay the
+    /// viewport settled on. `Duration::MAX` means "do not wake me up".
+    ///
+    /// egui spends its first couple of passes priming (font texture, deferred
+    /// repaint bookkeeping) and reports a zero delay there, so the settled value
+    /// is read after three passes.
+    fn settled_repaint_delay(app: &mut App) -> Duration {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(760.0, 560.0),
+            )),
+            ..Default::default()
+        };
+        let mut delay = Duration::ZERO;
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(raw.clone(), |ui| app.draw(ui));
+            delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .expect("root viewport");
+            // There is no backend here to consume the font texture upload, so clear
+            // it rather than letting it panic on drop.
+            out.textures_delta.clear();
+        }
+        delay
+    }
+
+    /// Regression: `copied` used to be set on the first copy box click and never
+    /// cleared, so the guard in [`App::draw`] stayed armed and an idle window
+    /// repaints every tick forever.
+    /// Assert the viewport has scheduled *some* follow-up repaint. Compared as
+    /// "less than `Duration::MAX`" rather than exactly [`REPAINT`]: egui shaves
+    /// the time spent inside the passes off the reported delay, and revealing the
+    /// toast Area forces one settling frame.
+    fn assert_awake(delay: Duration) {
+        assert!(
+            delay < Duration::MAX,
+            "expected a scheduled repaint, got {delay:?}"
+        );
+        assert!(delay <= REPAINT, "repaints should not lag {REPAINT:?}");
+    }
+
+    #[test]
+    fn idle_window_falls_asleep_once_the_copy_toast_expires() {
+        let (mut app, _rt) = test_app();
+
+        // Idle, nothing ever copied: no repaint is requested at all.
+        assert_eq!(settled_repaint_delay(&mut app), Duration::MAX);
+
+        // A click arms the toast, so frames keep coming (even while idle) to fade it.
+        app.copied = Some(("whip", Instant::now()));
+        assert_awake(settled_repaint_delay(&mut app));
+
+        // The toast window has closed: the idle app must stop asking for frames and
+        // clear the flag that armed the guard. This is the regression — before the
+        // fix `copied` stayed set, so this stayed awake for ever.
+        app.copied = Some(("whip", Instant::now() - TOAST - Duration::from_millis(1)));
+        assert_eq!(
+            settled_repaint_delay(&mut app),
+            Duration::MAX,
+            "an expired toast must not keep an idle window repainting"
+        );
+        assert_eq!(app.copied, None, "the expired toast flag is cleared");
+    }
+
+    /// A live session always repaints, toast or not.
+    #[test]
+    fn an_active_session_always_repaints() {
+        let (mut app, _rt) = test_app();
+        app.state.lock().unwrap().mode = Mode::Broadcasting;
+        assert_awake(settled_repaint_delay(&mut app));
+    }
+
+    /// Render one real frame of the UI headlessly and return what was painted.
+    fn render_shapes(app: &mut App, size: egui::Vec2) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.draw(ui));
+        out.textures_delta.clear();
+        out.shapes
+    }
+
+    /// Render the live broadcast tab with viewers at the minimum window size, to
+    /// exercise the click-to-copy boxes, the viewers cell and the floating toast for
+    /// real: egui does the layout, and we check it paints, that the toast adds its
+    /// own painting, and that nothing escapes the window.
+    #[test]
+    fn broadcast_tab_renders_at_min_size() {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Broadcast;
+        {
+            let mut g = app.state.lock().unwrap();
+            g.mode = Mode::Broadcasting;
+            g.ticket = Some("endpointad…reused".into());
+            g.stats = Some(StreamStats {
+                viewers: 3,
+                ..Default::default()
+            });
+        }
+        let min = egui::vec2(560.0, 420.0);
+        app.copied = Some(("ticket", Instant::now()));
+
+        let with_toast = render_shapes(&mut app, min);
+        assert!(!with_toast.is_empty(), "the broadcast tab painted nothing");
+
+        // Nothing escapes the window: no overflow at the minimum size.
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), min);
+        for shape in &with_toast {
+            assert!(
+                window.expand(1.0).contains_rect(shape.clip_rect),
+                "painted rect {:?} escapes the window",
+                shape.clip_rect
+            );
+        }
+
+        // The toast contributes its own painting on top of the tab.
+        app.copied = None;
+        let without_toast = render_shapes(&mut app, min);
+        assert!(
+            with_toast.len() > without_toast.len(),
+            "the copy toast should add painting, got {} vs {}",
+            with_toast.len(),
+            without_toast.len()
+        );
+    }
+
+    /// Render the Watch tab at the minimum window size and assert nothing escapes
+    /// the window. The Watch tab has a multiline ticket box, two combo boxes and a
+    /// buffer field, so it is checked separately from the broadcast tab.
+    #[test]
+    fn watch_tab_renders_at_min_size() {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        app.watch_ticket = "a-friend-ticket-string-that-is-long-ish".into();
+        let min = egui::vec2(560.0, 420.0);
+        let shapes = render_shapes(&mut app, min);
+        assert!(!shapes.is_empty(), "the watch tab painted nothing");
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), min);
+        for shape in &shapes {
+            assert!(
+                window.expand(1.0).contains_rect(shape.clip_rect),
+                "painted rect {:?} escapes the window",
+                shape.clip_rect
+            );
+        }
+    }
+
+    #[test]
+    fn expire_copied_leaves_a_live_toast_alone() {
+        let at = Instant::now();
+        assert!(expire_copied(Some(("ticket", at)), Duration::from_secs(10)).is_some());
+        assert!(expire_copied(Some(("ticket", at)), Duration::ZERO).is_none());
+        assert!(expire_copied(None, Duration::from_secs(10)).is_none());
+    }
+
+    #[test]
+    fn truncate_stays_within_budget() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hell…");
+        assert_eq!(truncate("hello world", 5).chars().count(), 5);
     }
 }

@@ -16,6 +16,7 @@
 
 use std::{
     path::PathBuf,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -25,7 +26,7 @@ use dumbpipe::{
     EndpointTicket, WEBRTC_ALPN,
 };
 use eframe::egui;
-use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle, time::timeout};
 
 use crate::{udp, CommonArgs, ONLINE_TIMEOUT};
@@ -73,9 +74,9 @@ pub struct SharedState {
     /// The current mode.
     pub(crate) mode: Mode,
     /// The live statistics of a broadcast, `None` when not broadcasting.
-    stats: Option<StreamStats>,
+    pub(crate) stats: Option<StreamStats>,
     /// The current broadcast ticket, shown after the endpoint is online.
-    ticket: Option<String>,
+    pub(crate) ticket: Option<String>,
     /// The WHIP URL to give OBS, tracking the configured host and port.
     whip_url: String,
     /// The last error surfaced to the UI.
@@ -131,9 +132,23 @@ pub fn whip_url(host: &str, port: u16) -> String {
 /// Bring up the shared endpoint, or return the existing one.
 ///
 /// Never holds the mutex across the `bind`, so it is safe with `std::Mutex`.
+///
+/// A cached endpoint is reused only while it is still open. `listen_whip`
+/// closes the endpoint it is handed when it returns — including on an engine
+/// error, or when the WHIP bind fails (a port already in use) — and the abort
+/// path of `stop` deliberately leaves it open for reuse. So a stored endpoint
+/// that reports `is_closed` is a dead handle: handing it back would let the
+/// next broadcast bind nothing, `accept` would return `None` at once, and the
+/// session would flash to `Broadcasting` and straight back to `Idle` with no
+/// error. Drop it and bind a fresh one instead; the identity is unchanged (same
+/// secret), so a persisted ticket still points at this endpoint.
 async fn ensure_endpoint(state: &Arc<Mutex<SharedState>>) -> crate::Result<Endpoint> {
-    if let Some(endpoint) = state.lock().unwrap().endpoint.clone() {
-        return Ok(endpoint);
+    let cached = state.lock().unwrap().endpoint.clone();
+    if let Some(endpoint) = cached {
+        if !endpoint.is_closed() {
+            return Ok(endpoint);
+        }
+        tracing::debug!("the cached endpoint is closed, binding a fresh one");
     }
     let secret = state.lock().unwrap().secret.clone();
     let common = CommonArgs {
@@ -170,13 +185,49 @@ pub struct BroadcastParams {
     pub url: String,
     /// The bearer token OBS must present, if any.
     pub bearer_token: Option<String>,
+    /// The persisted broadcast ticket to re-display, if any.
+    pub persisted_ticket: Option<String>,
+    /// Whether the WHIP host and port are unchanged since `persisted_ticket` was
+    /// issued. Both sides of this comparison use the trimmed host.
+    pub host_port_ok: bool,
+}
+
+/// Decide whether to re-display a persisted broadcast ticket, or mint a new one.
+///
+/// Two gates, in order:
+///
+/// 1. **Host/port rule.** The ticket stays put unless the WHIP ingest endpoint
+///    moves, so a changed host or port means a new ticket.
+/// 2. **Identity guard.** The ticket must have been issued for *this* endpoint.
+///    `broadcast_host`/`broadcast_port` persist independently of `secret_hex`, so
+///    a changed identity (`IROH_SECRET` set, or a regenerated secret) alongside an
+///    unchanged host/port would otherwise re-advertise a ticket pointing at a dead
+///    [`EndpointId`] that no viewer can ever reach.
+///
+/// A reused ticket carries the per-session transport addresses of the run that
+/// minted it, which are stale by then. It still connects because relays forward
+/// encrypted traffic keyed on the stable [`EndpointId`], and the viewer's address
+/// lookup re-resolves live addresses once the stale ones are unreachable.
+pub fn reuse_ticket(
+    persisted: Option<String>,
+    host_port_ok: bool,
+    current_id: EndpointId,
+) -> Option<String> {
+    if !host_port_ok {
+        return None;
+    }
+    let ticket = persisted?;
+    EndpointTicket::from_str(&ticket)
+        .ok()
+        .filter(|tk| tk.endpoint_addr().id == current_id)
+        .map(|_| ticket)
 }
 
 /// Start a broadcast session, returning its task handle to store in the state.
 ///
 /// Sets the mode to `Starting` synchronously, then brings the endpoint online,
-/// derives a fresh ticket, and runs [`webrtc::listen_whip`] until it returns or
-/// is aborted.
+/// decides which ticket to display (see [`reuse_ticket`]) and runs
+/// [`webrtc::listen_whip`] until it returns or is aborted.
 pub fn spawn_broadcast(
     state: Arc<Mutex<SharedState>>,
     handle: Handle,
@@ -202,7 +253,12 @@ pub fn spawn_broadcast(
             tracing::warn!("failed to connect to the home relay");
         }
         let addr = endpoint.addr();
-        let ticket = EndpointTicket::new(addr).to_string();
+        let fresh = EndpointTicket::new(addr).to_string();
+        // Log the live ticket every session. If a reused ticket ever fails to
+        // connect, this is the string that would have worked.
+        tracing::debug!("fresh ticket for this session: {fresh}");
+        let shown = reuse_ticket(params.persisted_ticket, params.host_port_ok, endpoint.id())
+            .unwrap_or(fresh);
         let listen = match udp::resolve(&params.listen) {
             Ok(listen) => listen,
             Err(e) => {
@@ -211,7 +267,7 @@ pub fn spawn_broadcast(
         };
         {
             let mut g = state.lock().unwrap();
-            g.ticket = Some(ticket);
+            g.ticket = Some(shown);
             g.whip_url = params.url.clone();
             g.mode = Mode::Broadcasting;
         }
@@ -329,5 +385,107 @@ pub async fn consume_stats(
     while let Some(stats) = rx.recv().await {
         state.lock().unwrap().stats = Some(stats);
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mint a ticket string for a given identity, the way `spawn_broadcast` does
+    /// with a live endpoint.
+    fn ticket_for(secret: &SecretKey) -> String {
+        EndpointTicket::new(EndpointAddr::new(secret.public())).to_string()
+    }
+
+    #[test]
+    fn reuses_ticket_when_host_port_and_identity_match() {
+        let secret = SecretKey::generate();
+        let persisted = ticket_for(&secret);
+        assert_eq!(
+            reuse_ticket(Some(persisted.clone()), true, secret.public()).as_deref(),
+            Some(persisted.as_str()),
+            "an unchanged host, port and identity must re-display the same ticket"
+        );
+    }
+
+    #[test]
+    fn mints_new_ticket_when_host_or_port_changed() {
+        let secret = SecretKey::generate();
+        let persisted = ticket_for(&secret);
+        assert_eq!(
+            reuse_ticket(Some(persisted), false, secret.public()),
+            None,
+            "the ticket moves when the ingest endpoint moves"
+        );
+    }
+
+    #[test]
+    fn mints_new_ticket_when_identity_changed() {
+        // The host/port gate alone is not enough. `broadcast_host`/`broadcast_port`
+        // persist independently of `secret_hex`, so a changed identity with an
+        // unchanged host/port would otherwise re-advertise a ticket pointing at a
+        // dead `EndpointId` that no viewer can ever reach.
+        let old = SecretKey::generate();
+        let new = SecretKey::generate();
+        let persisted = ticket_for(&old);
+        assert_eq!(
+            reuse_ticket(Some(persisted), true, new.public()),
+            None,
+            "a ticket from a different identity is never reused"
+        );
+    }
+
+    #[test]
+    fn mints_new_ticket_when_nothing_persisted() {
+        let secret = SecretKey::generate();
+        assert_eq!(reuse_ticket(None, true, secret.public()), None);
+    }
+
+    #[test]
+    fn mints_new_ticket_when_persisted_ticket_is_unparsable() {
+        // A hand-edited or truncated config must not surface a broken ticket.
+        let secret = SecretKey::generate();
+        assert_eq!(
+            reuse_ticket(
+                Some("definitely-not-a-ticket".into()),
+                true,
+                secret.public()
+            ),
+            None
+        );
+    }
+
+    /// A cached endpoint is reused while open, but a closed one (as `listen_whip`
+    /// leaves it on any early return, e.g. a WHIP bind failure) must be replaced
+    /// with a live handle so the next broadcast actually binds. Regression: the
+    /// old `ensure_endpoint` handed back the closed endpoint, whose `accept`
+    /// returns `None` at once, so a "port in use → fix port → Start again" cycle
+    /// flashed `Broadcasting` and fell back to `Idle` while serving nothing.
+    #[tokio::test]
+    async fn a_closed_endpoint_is_replaced_on_the_next_session() {
+        let state = Arc::new(Mutex::new(SharedState::new(
+            SecretKey::generate(),
+            whip_url("127.0.0.1", 8080),
+        )));
+
+        let first = ensure_endpoint(&state).await.expect("bind");
+        // While open, the same endpoint is reused across calls.
+        let reused = ensure_endpoint(&state).await.expect("reuse");
+        assert!(!reused.is_closed());
+
+        // `listen_whip` closes the endpoint it was handed when it returns.
+        first.close().await;
+        assert!(first.is_closed());
+
+        // The next session must get a fresh, live endpoint, not the dead one.
+        let fresh = ensure_endpoint(&state).await.expect("rebind");
+        assert!(
+            !fresh.is_closed(),
+            "a closed endpoint must be replaced with a live one"
+        );
+        // Identity is stable across the rebind (same secret), so a persisted
+        // ticket still resolves to this endpoint.
+        assert_eq!(fresh.id(), reused.id());
     }
 }
