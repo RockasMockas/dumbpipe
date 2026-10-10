@@ -49,15 +49,16 @@ impl App {
                 ui.add_enabled_ui(!active, |ui| {
                     let big = ui.style().text_styles[&egui::TextStyle::Body].size * 1.3;
                     let prop = egui::FontId::proportional(big);
-                    let box_h = big * 1.7;
+                    let box_h = big * 1.3;
                     // Full-width editable field with its label on the line above.
                     let field = |ui: &mut Ui,
                                      label: &str,
                                      hint: Option<&str>,
                                      text: &mut String| {
                         ui.label(egui::RichText::new(label).size(big));
-                        let mut te =
-                            egui::TextEdit::singleline(text).font(prop.clone());
+                        let mut te = egui::TextEdit::singleline(text)
+                            .font(prop.clone())
+                            .vertical_align(egui::Align::Center);
                         if let Some(h) = hint {
                             te = te.hint_text(egui::RichText::new(h).size(big));
                         }
@@ -71,7 +72,9 @@ impl App {
                     let mut port = self.config.broadcast_port.to_string();
                     let resp = ui.add_sized(
                         [ui.available_width(), box_h],
-                        egui::TextEdit::singleline(&mut port).font(prop.clone()),
+                        egui::TextEdit::singleline(&mut port)
+                            .font(prop.clone())
+                            .vertical_align(egui::Align::Center),
                     );
                     if resp.changed() {
                         if let Ok(p) = port.trim().parse::<u16>() {

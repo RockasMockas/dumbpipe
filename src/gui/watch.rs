@@ -8,7 +8,7 @@ use eframe::egui::{self, Context, Ui};
 use super::{
     config::{player_key, PLAYERS},
     state::{self, Mode, WatchParams},
-    truncate, App, ACCENT,
+    App, ACCENT,
 };
 
 /// Parse a buffer field (milliseconds) into an option; blank or invalid is
@@ -98,36 +98,22 @@ impl App {
             self.start_watch(ui.ctx());
         }
 
-        // A quick history picker for recently watched tickets.
-        let history = self.config.ticket_history.clone();
-        if !history.is_empty() && !busy {
-            ui.horizontal(|ui| {
-                ui.weak("Recent:");
-                egui::ComboBox::from_id_salt("ticket_history")
-                    .selected_text("choose…")
-                    .show_ui(ui, |ui| {
-                        for ticket in history {
-                            if ui
-                                .selectable_value(
-                                    &mut self.watch_ticket,
-                                    ticket.clone(),
-                                    truncate(&ticket, 48),
-                                )
-                                .clicked()
-                            {
-                                // selection applied by selectable_value
-                            }
-                        }
-                    });
-            });
-        }
+        // The ticket box itself remembers the last-used ticket (seeded from
+        // `config.last_ticket` at startup and updated on each watch), so no
+        // separate history picker is needed.
 
         ui.add_space(8.0);
+        // Match the Broadcast tab's "Advanced settings" sizing: a larger (1.3×)
+        // proportional font and matching input-box height, so the controls read as
+        // one consistent column across tabs.
+        let big = ui.style().text_styles[&egui::TextStyle::Body].size * 1.3;
+        let prop = egui::FontId::proportional(big);
+        let box_h = big * 1.3;
         ui.horizontal(|ui| {
-            ui.strong("Player");
+            ui.label(egui::RichText::new("Player").size(big));
             ui.add_enabled_ui(!busy, |ui| {
                 egui::ComboBox::from_id_salt("watch_player")
-                    .selected_text(player_key(self.watch_player))
+                    .selected_text(egui::RichText::new(player_key(self.watch_player)).size(big))
                     .show_ui(ui, |ui| {
                         for player in PLAYERS {
                             ui.selectable_value(&mut self.watch_player, player, player_key(player));
@@ -135,12 +121,14 @@ impl App {
                     });
             });
             ui.add_space(12.0);
-            ui.strong("Buffer (ms)");
+            ui.label(egui::RichText::new("Buffer (ms)").size(big));
             ui.add_enabled_ui(!busy, |ui| {
-                ui.add(
+                ui.add_sized(
+                    [90.0, box_h],
                     egui::TextEdit::singleline(&mut self.watch_buffer)
-                        .hint_text("auto")
-                        .desired_width(80.0),
+                        .hint_text(egui::RichText::new("auto").size(big))
+                        .font(prop.clone())
+                        .vertical_align(egui::Align::Center),
                 )
             });
         });
@@ -150,8 +138,8 @@ impl App {
         }
 
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if watching || starting {
+        if watching || starting {
+            ui.horizontal(|ui| {
                 if ui
                     .add(egui::Button::new("■  Stop").min_size(egui::vec2(140.0, 30.0)))
                     .clicked()
@@ -159,28 +147,30 @@ impl App {
                     state::stop(&self.state, ui.ctx());
                 }
                 ui.label(watch_action_label(snap.mode));
-            } else {
-                let button = egui::Button::new("▶  Watch Stream")
-                    .min_size(egui::vec2(160.0, 30.0))
-                    .fill(ACCENT.gamma_multiply(0.18))
-                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
-                let can_start = watch_can_start(busy, &self.watch_ticket);
-                if ui.add_enabled(can_start, button).clicked() {
-                    self.start_watch(ui.ctx());
-                }
-                if !busy && self.watch_ticket.trim().is_empty() {
-                    ui.weak("paste a ticket to begin");
-                }
+            });
+        } else {
+            // Full-width primary action, matching the Broadcast tab's Start button.
+            let button = egui::Button::new("▶  Watch Stream")
+                .fill(ACCENT.gamma_multiply(0.18))
+                .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
+            let can_start = watch_can_start(busy, &self.watch_ticket);
+            let resp = ui
+                .add_enabled_ui(can_start, |ui| {
+                    ui.add_sized([ui.available_width(), 36.0], button)
+                })
+                .inner;
+            if resp.clicked() {
+                self.start_watch(ui.ctx());
             }
-        });
+            if !busy && self.watch_ticket.trim().is_empty() {
+                ui.weak("paste a ticket to begin");
+            }
+        }
 
         if let Some(err) = &snap.error {
             ui.add_space(6.0);
             ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
         }
-
-        ui.add_space(6.0);
-        ui.weak("The player launches on the local RTP ports; close it or press Stop to end.");
     }
 
     /// Validate the ticket and start a watch session.
