@@ -22,6 +22,9 @@ impl App {
         let active = snap.mode.active();
         let broadcasting = snap.mode == Mode::Broadcasting;
         let starting = snap.mode == Mode::Starting;
+        // Read window focus up front so the idle start button can autofocus itself
+        // on the first focused frame (immutable read; the layout borrows follow).
+        let window_focused = ui.input(|i| i.focused);
 
         // Advanced settings: host, port and bearer token, prefilled. Collapsed by
         // default so the common case is just the start button.
@@ -95,7 +98,21 @@ impl App {
                     .min_size(egui::vec2(180.0, 30.0))
                     .fill(ACCENT.gamma_multiply(0.18))
                     .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
-                if ui.add_enabled(!active, button).clicked() {
+                // Autofocus the start control on the first window-focused idle frame so
+                // Enter/Space starts it; the Stop button (shown while active) is never
+                // autofocused, so a stray Enter can never tear down a live stream. The
+                // button's auto id is stable across frames, so focus requested off
+                // `resp` sticks to it without needing an explicit id.
+                let resp = ui.add_enabled(!active, button);
+                if self.focus_primary && window_focused {
+                    if !active {
+                        resp.request_focus();
+                    }
+                    self.focus_primary = false;
+                }
+                // Mouse click and keyboard (Space/Enter on the focused button) both
+                // arrive via `clicked()` — a single trigger, no parallel Enter gate.
+                if resp.clicked() {
                     self.start_broadcast(ui.ctx());
                 }
             }
@@ -221,7 +238,7 @@ impl App {
             let stats = snap.stats.unwrap_or_default();
             egui::Grid::new("stats_grid")
                 .num_columns(2)
-                .spacing([16.0, 4.0])
+                .spacing([18.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Viewers");
                     viewers_cell(ui, stats.viewers, self.pulse.elapsed().as_secs_f32());

@@ -33,6 +33,14 @@ fn watch_can_start(busy: bool, ticket: &str) -> bool {
     !busy && !ticket.trim().is_empty()
 }
 
+/// Whether Enter should start a watch session: the ticket box must own keyboard
+/// focus, Enter must be pressed, and the same idle-with-non-blank-ticket gate the
+/// button uses must hold. Extracted so the keyboard gate is testable without any
+/// focus plumbing.
+fn watch_enter_starts(focused: bool, enter: bool, busy: bool, ticket: &str) -> bool {
+    focused && enter && watch_can_start(busy, ticket)
+}
+
 impl App {
     /// Render the Watch Stream tab.
     pub fn watch_tab(&mut self, ui: &mut Ui) {
@@ -42,16 +50,53 @@ impl App {
         let starting = snap.mode == Mode::Starting;
 
         ui.strong("Stream ticket");
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 54.0],
-                    egui::TextEdit::multiline(&mut self.watch_ticket)
-                        .hint_text("paste a ticket from a friend")
-                        .background_color(egui::Color32::from_rgba_unmultiplied(80, 200, 120, 14)),
-                )
-            });
-        });
+
+        // Read input BEFORE rendering the ticket box, so a key consumed by the
+        // widget later in this frame cannot defeat Enter-to-start.
+        let ticket_id = egui::Id::new("watch_ticket_input");
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let window_focused = ui.input(|i| i.focused);
+
+        // A framed surface via the TextEdit's OWN frame (not an outer group, which
+        // would double the border and eat width). `return_key(None)` suppresses the
+        // stray newline Enter would otherwise insert into a multiline box.
+        let textedit = egui::TextEdit::multiline(&mut self.watch_ticket)
+            .id(ticket_id)
+            .hint_text("paste a ticket from a friend")
+            .return_key(None::<egui::KeyboardShortcut>)
+            .frame(
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(80, 200, 120, 14))
+                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.4)))
+                    .inner_margin(egui::Margin::symmetric(6, 4)),
+            );
+        let resp = ui
+            .add_enabled_ui(!busy, |ui| {
+                ui.add_sized([ui.available_width(), 54.0], textedit)
+            })
+            .inner;
+
+        // Autofocus the ticket only when it already holds a prefilled ticket, on a
+        // window that has keyboard focus, and once per switch. Autofocusing an empty
+        // box would only blink a caret that can never submit (Enter on a blank ticket
+        // is a no-op), and a focused multiline TextEdit schedules ~2Hz caret-blink
+        // repaints that would keep an idle Watch tab from ever falling asleep. A
+        // prefilled ticket is exactly the "press Enter to replay" case worth grabbing.
+        // (`RawInput::default().focused` is `true`, so a bare focus flag is not a
+        // sufficient guard against the repaint-sleep regression.)
+        if self.focus_primary && window_focused {
+            if !busy && !self.watch_ticket.trim().is_empty() {
+                resp.request_focus();
+            }
+            self.focus_primary = false;
+        }
+
+        // Enter-to-start, gated on the box actually owning focus and the button's
+        // own idle/non-blank conditions. Focus is read off the same `resp`.
+        let focused = ui.ctx().memory(|m| m.has_focus(resp.id));
+        if watch_enter_starts(focused, enter, busy, &self.watch_ticket) {
+            self.start_watch(ui.ctx());
+        }
 
         // A quick history picker for recently watched tickets.
         let history = self.config.ticket_history.clone();
@@ -92,9 +137,10 @@ impl App {
             ui.add_space(12.0);
             ui.strong("Buffer (ms)");
             ui.add_enabled_ui(!busy, |ui| {
-                ui.add_sized(
-                    [80.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.watch_buffer).hint_text("auto"),
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.watch_buffer)
+                        .hint_text("auto")
+                        .desired_width(80.0),
                 )
             });
         });
@@ -211,5 +257,21 @@ mod tests {
         assert!(!watch_can_start(false, ""));
         assert!(watch_can_start(false, "abc"));
         assert!(!watch_can_start(true, "abc"));
+    }
+
+    #[test]
+    fn watch_enter_starts_needs_focus_enter_and_a_startable_ticket() {
+        // Enter starts only when the box owns focus, Enter is pressed, and the
+        // button's own idle/non-blank gate holds.
+        assert!(watch_enter_starts(true, true, false, "abc"));
+        // Not focused → never starts (Enter elsewhere must not fire a watch).
+        assert!(!watch_enter_starts(false, true, false, "abc"));
+        // No Enter → nothing to trigger.
+        assert!(!watch_enter_starts(true, false, false, "abc"));
+        // Blank ticket → mirrors the disabled button.
+        assert!(!watch_enter_starts(true, true, false, "  "));
+        assert!(!watch_enter_starts(true, true, false, ""));
+        // Busy (incl. Starting) → mirrors the disabled button.
+        assert!(!watch_enter_starts(true, true, true, "abc"));
     }
 }

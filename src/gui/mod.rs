@@ -73,6 +73,12 @@ pub struct App {
     copied: Option<(&'static str, Instant)>,
     /// Clock origin for the viewers pulse, so it animates smoothly while live.
     pulse: Instant,
+    /// Whether the next window-focused frame should autofocus the active tab's
+    /// primary control (the ticket box on Watch, the start button on Broadcast).
+    /// Set on open and on every tab switch; cleared the first time a window that
+    /// actually has keyboard focus consumes it, so it never steals focus from a
+    /// widget the user has already chosen.
+    focus_primary: bool,
 }
 
 impl App {
@@ -103,6 +109,7 @@ impl App {
             watch_buffer,
             copied: None,
             pulse: Instant::now(),
+            focus_primary: true,
         }
     }
 
@@ -153,25 +160,29 @@ impl App {
                 let b = ui.selectable_label(self.tab == Tab::Broadcast, "Start Broadcasting");
                 if w.clicked() {
                     self.tab = Tab::Watch;
+                    self.focus_primary = true;
                 }
                 if b.clicked() {
                     self.tab = Tab::Broadcast;
+                    self.focus_primary = true;
                 }
                 (w, b)
             })
             .inner;
         // A persistent accent underline marks the active tab, so selection is
-        // legible even when the selectable_label background is subtle.
+        // legible even when the selectable_label background is subtle. A slim,
+        // rounded bar inset from each tab edge reads as deliberate rather than a
+        // heavy full-width block.
         let active_rect = if self.tab == Tab::Watch {
             watch.rect
         } else {
             bc.rect
         };
         let underline = egui::Rect::from_min_max(
-            active_rect.left_bottom() - egui::vec2(0.0, 2.0),
-            active_rect.right_bottom(),
+            egui::pos2(active_rect.min.x + 5.0, active_rect.max.y - 2.0),
+            egui::pos2(active_rect.max.x - 5.0, active_rect.max.y),
         );
-        ui.painter().rect_filled(underline, 0.0, ACCENT);
+        ui.painter().rect_filled(underline, egui::CornerRadius::same(1), ACCENT);
         ui.separator();
     }
 
@@ -755,6 +766,128 @@ mod tests {
             watch_button_rects("   "),
             0,
             "a blank ticket disables the Watch button, dropping it from the set"
+        );
+    }
+
+    /// A focused, window-keyboard-focused raw input at the default window size.
+    fn focused_raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(760.0, 560.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Run one headless frame, discarding the font-texture upload no backend eats.
+    fn frame(ctx: &egui::Context, app: &mut App, raw: egui::RawInput) {
+        let mut out = ctx.run_ui(raw, |ui| app.draw(ui));
+        out.textures_delta.clear();
+    }
+
+    /// A single Enter key press event.
+    fn enter_key() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Autofocus grabs a prefilled ticket (the "press Enter to replay" case) but
+    /// leaves an empty box unfocused, so an idle Watch tab still falls asleep.
+    #[test]
+    fn autofocus_grabs_a_prefilled_ticket_but_not_an_empty_one() {
+        // Prefilled: focus is taken within a couple of frames, no click issued.
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        app.watch_ticket = "a-persisted-ticket".into();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "a prefilled ticket autofocuses so Enter can start it"
+        );
+
+        // Empty: nothing focuses (an empty box can never submit), which is exactly
+        // what keeps the repaint-sleep regression green under `focused: true`.
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        assert_eq!(
+            app.watch_ticket, "",
+            "the headless app opens with an empty ticket"
+        );
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "an empty ticket must not autofocus (no blink repaints while idle)"
+        );
+    }
+
+    /// Regression for the concrete wart: Enter on the focused ticket box used to
+    /// drop a stray newline into the multiline field. Now Enter never inserts a
+    /// newline, and an invalid ticket never starts (matching the button path).
+    #[test]
+    fn enter_on_the_focused_ticket_never_inserts_a_newline() {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        app.watch_ticket = "not-a-real-ticket".into();
+        let ctx = egui::Context::default();
+        // Two frames to let autofocus settle, then press Enter with focus held.
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        assert!(ctx.memory(|m| m.focused()).is_some(), "ticket autofocused");
+        frame(&ctx, &mut app, focused_raw(vec![enter_key()]));
+
+        assert!(
+            !app.watch_ticket.contains('\n'),
+            "Enter must not drop a newline into the ticket box"
+        );
+        assert_eq!(app.watch_ticket, "not-a-real-ticket", "ticket text untouched");
+        assert_eq!(
+            app.state.lock().unwrap().mode,
+            Mode::Idle,
+            "an invalid ticket surfaces an inline error but never starts"
+        );
+    }
+
+    /// A blank ticket never starts a session, focused Enter or not.
+    #[test]
+    fn enter_on_a_blank_ticket_does_not_start() {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Watch;
+        // Force focus on the (blank) box to isolate the blank gate from autofocus.
+        app.focus_primary = false;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, focused_raw(vec![enter_key()]));
+        assert_eq!(
+            app.state.lock().unwrap().mode,
+            Mode::Idle,
+            "Enter on a blank ticket does not start a session"
+        );
+    }
+
+    /// On the Broadcast tab, when idle and focused, the start button owns keyboard
+    /// focus so Enter/Space can start it (AC4 precondition). Real-app start then
+    /// flows through the button's native keyboard `clicked()`.
+    #[test]
+    fn broadcast_start_button_autofocuses_when_idle() {
+        let (mut app, _rt) = test_app();
+        app.tab = Tab::Broadcast;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        frame(&ctx, &mut app, focused_raw(vec![]));
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "the idle start button autofocuses so Enter/Space can start it"
         );
     }
 }
