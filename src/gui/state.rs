@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use dumbpipe::{
+use streampipe::{
     webrtc::{self, Player, StreamStats, ViewerConfig, WhipConfig},
     EndpointTicket, WEBRTC_ALPN,
 };

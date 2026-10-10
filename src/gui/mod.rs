@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dumbpipe::webrtc::{Player, StreamStats};
+use streampipe::webrtc::{Player, StreamStats};
 use eframe::egui::{self, Ui};
 use tokio::{runtime::Handle, sync::mpsc};
 

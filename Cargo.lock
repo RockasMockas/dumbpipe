@@ -1254,37 +1254,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dumbpipe"
-version = "0.39.0"
-dependencies = [
- "bytes",
- "clap",
- "data-encoding",
- "duct",
- "eframe",
- "hex",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "iroh",
- "iroh-tickets",
- "n0-error",
- "nix",
- "noq",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "socket2",
- "str0m",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5162,6 +5131,37 @@ dependencies = [
  "sha2 0.10.9",
  "str0m-proto",
  "time",
+]
+
+[[package]]
+name = "streampipe"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "data-encoding",
+ "duct",
+ "eframe",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "iroh-tickets",
+ "n0-error",
+ "nix",
+ "noq",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "socket2",
+ "str0m",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

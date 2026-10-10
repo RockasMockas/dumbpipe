@@ -14,11 +14,33 @@ pub const HANDSHAKE: [u8; 5] = *b"hello";
 ///
 /// Deliberately different from the stream and udp ALPNs, so that a webrtc
 /// viewer can never be mistaken for a stream or udp connector and vice versa.
-pub const WEBRTC_ALPN: &[u8] = b"DUMBPIPE_WEBRTC_V0";
+pub const WEBRTC_ALPN: &[u8] = b"STREAMPIPE_WEBRTC_V0";
 
 pub mod rtp;
 pub mod sdp;
+pub mod udp;
 pub mod webrtc;
 pub mod whip;
 
 pub use iroh_tickets::endpoint::EndpointTicket;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classic pipe path must stay wire-compatible with upstream dumbpipe,
+    /// so these two constants are pinned and must never change.
+    #[test]
+    fn classic_pipe_wire_compat_is_pinned() {
+        assert_eq!(ALPN, b"DUMBPIPEV0");
+        assert_eq!(HANDSHAKE, *b"hello");
+    }
+
+    /// WebRTC and UDP are streampipe-only features, so they carry the
+    /// streampipe identity on the wire.
+    #[test]
+    fn new_features_use_streampipe_alpn() {
+        assert_eq!(WEBRTC_ALPN, b"STREAMPIPE_WEBRTC_V0");
+        assert_eq!(udp::ALPN, b"STREAMPIPE_UDP_V0");
+    }
+}

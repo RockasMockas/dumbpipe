@@ -114,6 +114,6 @@ jobs:
         # uses: obi1kenobi/cargo-semver-checks-action@v2
         uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f # feat-baseline
         with:
-          package: dumbpipe
+          package: streampipe
           baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
           use-cache: false

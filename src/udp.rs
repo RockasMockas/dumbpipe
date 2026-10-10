@@ -49,9 +49,9 @@ use tokio::net::UdpSocket;
 
 /// The ALPN used by the udp subcommands.
 ///
-/// Deliberately different from the stream ALPN `dumbpipe::ALPN`, so that a
+/// Deliberately different from the stream ALPN `streampipe::ALPN`, so that a
 /// udp connector can never be mistaken for a stream connector and vice versa.
-pub const ALPN: &[u8] = b"DUMBPIPE_UDP_V0";
+pub const ALPN: &[u8] = b"STREAMPIPE_UDP_V0";
 
 /// Size of the buffer used to receive from a UDP socket.
 ///

@@ -153,7 +153,7 @@ impl Player {
                 // second --demuxer-lavf-o. ffmpeg's default reorder_queue_size
                 // is 500 packets, which overflows ("jitter buffer full") before
                 // max_delay is reached at high bitrate; raise the ceiling so the
-                // author's two-stage reorder (dumbpipe + ffmpeg) works as intended.
+                // author's two-stage reorder (streampipe + ffmpeg) works as intended.
                 let mut lavf_o = "buffer_size=4194304".to_string();
                 match buffer {
                     Some(ms) => {
@@ -168,7 +168,7 @@ impl Player {
                     None => {
                         cmd.push("--no-cache".into());
                         cmd.push("--profile=low-latency".into());
-                        // dumbpipe already strictly reorders RTP, so neuter
+                        // streampipe already strictly reorders RTP, so neuter
                         // ffmpeg's redundant queue to avoid its 100 ms default wait.
                         lavf_o.push_str(",max_delay=0,reorder_queue_size=0");
                     }
@@ -204,7 +204,7 @@ impl Player {
                         ]);
                     }
                     None => {
-                        // dumbpipe already strictly reorders RTP, so disable
+                        // streampipe already strictly reorders RTP, so disable
                         // ffmpeg's queue to avoid its 100 ms default wait.
                         cmd.extend(["-fflags".into(), "nobuffer".into()]);
                         cmd.extend([
@@ -1061,7 +1061,7 @@ impl Host {
             viewer.streaming = false;
         }
         self.etag_seq += 1;
-        let etag = format!("dumbpipe-{}", self.etag_seq);
+        let etag = format!("streampipe-{}", self.etag_seq);
         tracing::info!(
             "accepted a whip {} with {} media line(s), etag {etag}",
             if via_put { "PUT" } else { "POST" },
@@ -1975,7 +1975,7 @@ fn sdp_path(
     here: bool,
     video_port: u16,
 ) -> std::path::PathBuf {
-    let name = format!("dumbpipe-{video_port}.sdp");
+    let name = format!("streampipe-{video_port}.sdp");
     if let Some(p) = explicit.filter(|p| !p.as_os_str().is_empty()) {
         return if p.is_dir() { p.join(name) } else { p };
     }
@@ -2485,7 +2485,7 @@ mod tests {
         assert!(here.starts_with(std::env::current_dir().unwrap()));
         assert_eq!(
             here.file_name().unwrap().to_str().unwrap(),
-            "dumbpipe-5004.sdp"
+            "streampipe-5004.sdp"
         );
         // A launched player with no path keeps it in the temp dir.
         let tmp = sdp_path(None, false, 5004);

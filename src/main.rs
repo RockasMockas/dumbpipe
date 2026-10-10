@@ -12,7 +12,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use dumbpipe::{webrtc, EndpointTicket};
+use streampipe::{webrtc, EndpointTicket};
 use iroh::{
     endpoint::{presets, Accepting, QuicTransportConfig},
     Endpoint, EndpointAddr, SecretKey,
@@ -261,7 +261,7 @@ impl CommonArgs {
     fn alpn(&self) -> Result<Vec<u8>> {
         Ok(match &self.custom_alpn {
             Some(alpn) => parse_alpn(alpn)?,
-            None => dumbpipe::ALPN.to_vec(),
+            None => streampipe::ALPN.to_vec(),
         })
     }
 
@@ -347,7 +347,7 @@ fn udp_alpn(common: &CommonArgs) -> Result<Vec<u8>> {
 fn webrtc_alpn(common: &CommonArgs) -> Result<Vec<u8>> {
     Ok(match &common.custom_alpn {
         Some(alpn) => parse_alpn(alpn)?,
-        None => dumbpipe::WEBRTC_ALPN.to_vec(),
+        None => streampipe::WEBRTC_ALPN.to_vec(),
     })
 }
 
@@ -462,7 +462,7 @@ pub struct ConnectWhipArgs {
     /// Where to write the SDP file that describes the stream to the player.
     ///
     /// The value is optional: `--sdp` on its own writes the default file
-    /// (`dumbpipe-<port>.sdp`) into the current folder, so you can open it by
+    /// (`streampipe-<port>.sdp`) into the current folder, so you can open it by
     /// hand. Give a path with an equals sign, `--sdp=/tmp/mine.sdp`, to choose
     /// the name, or a directory to put the default file inside it.
     #[clap(long, num_args(0..=1), require_equals(true))]
@@ -631,16 +631,16 @@ async fn copy_from_noq(
 
 /// Read and verify the handshake from a noq stream.
 async fn read_handshake(recv: &mut noq::RecvStream) -> Result<()> {
-    let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
+    let mut buf = [0u8; streampipe::HANDSHAKE.len()];
     recv.read_exact(&mut buf).await.anyerr()?;
-    ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+    ensure_any!(buf == streampipe::HANDSHAKE, "invalid handshake");
     tracing::debug!("handshake verified");
     Ok(())
 }
 
 /// Write the handshake to a noq stream.
 async fn write_handshake(send: &mut noq::SendStream) -> Result<()> {
-    send.write_all(&dumbpipe::HANDSHAKE).await.anyerr()?;
+    send.write_all(&streampipe::HANDSHAKE).await.anyerr()?;
     tracing::debug!("handshake sent");
     Ok(())
 }

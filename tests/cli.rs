@@ -7,11 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dumbpipe::EndpointTicket;
+use streampipe::EndpointTicket;
 use rand::RngExt;
 
 // binary path
-fn dumbpipe_bin() -> &'static str {
+fn streampipe_bin() -> &'static str {
     env!("CARGO_BIN_EXE_streampipe")
 }
 
@@ -58,7 +58,7 @@ fn connect_listen_happy() {
     // the bytes provided by the listen command
     let listen_to_connect = b"hello from listen";
     let connect_to_listen = b"hello from connect";
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(streampipe_bin(), ["listen"])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(listen_to_connect)
         .stderr_to_stdout() //
@@ -70,7 +70,7 @@ fn connect_listen_happy() {
     let ticket = header.split_ascii_whitespace().last().unwrap();
     let ticket = EndpointTicket::from_str(ticket).unwrap();
 
-    let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
+    let connect = duct::cmd(streampipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(connect_to_listen)
         .stderr_null()
@@ -97,7 +97,7 @@ fn connect_listen_custom_alpn_happy() {
     let listen_to_connect = b"hello from listen";
     let connect_to_listen = b"hello from connect";
     let mut listen = duct::cmd(
-        dumbpipe_bin(),
+        streampipe_bin(),
         ["listen", "--custom-alpn", "utf8:mysuperalpn/0.1.0"],
     )
     .env_remove("RUST_LOG") // disable tracing
@@ -112,7 +112,7 @@ fn connect_listen_custom_alpn_happy() {
     let ticket = EndpointTicket::from_str(ticket).unwrap();
 
     let connect = duct::cmd(
-        dumbpipe_bin(),
+        streampipe_bin(),
         [
             "connect",
             &ticket.to_string(),
@@ -143,7 +143,7 @@ fn connect_listen_ctrlc_connect() {
         unistd::Pid,
     };
     // the bytes provided by the listen command
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(streampipe_bin(), ["listen"])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(b"hello from listen\n")
         .stderr_to_stdout() //
@@ -155,7 +155,7 @@ fn connect_listen_ctrlc_connect() {
     let ticket = header.split_ascii_whitespace().last().unwrap();
     let ticket = EndpointTicket::from_str(ticket).unwrap();
 
-    let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
+    let mut connect = duct::cmd(streampipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_null()
         .stdout_capture()
@@ -184,7 +184,7 @@ fn connect_listen_ctrlc_listen() {
         unistd::Pid,
     };
     // the bytes provided by the listen command
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    let mut listen = duct::cmd(streampipe_bin(), ["listen"])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_to_stdout()
         .reader()
@@ -195,7 +195,7 @@ fn connect_listen_ctrlc_listen() {
     let ticket = header.split_ascii_whitespace().last().unwrap();
     let ticket = EndpointTicket::from_str(ticket).unwrap();
 
-    let mut connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
+    let mut connect = duct::cmd(streampipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_null()
         .stdout_capture()
@@ -234,8 +234,8 @@ fn listen_tcp_happy() {
     });
     // wait for the tcp listener to start
     b2.wait();
-    // start a dumbpipe listen-tcp process
-    let mut listen_tcp = duct::cmd(dumbpipe_bin(), ["listen-tcp", "--host", &host_port])
+    // start a streampipe listen-tcp process
+    let mut listen_tcp = duct::cmd(streampipe_bin(), ["listen-tcp", "--host", &host_port])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_to_stdout() //
         .reader()
@@ -245,7 +245,7 @@ fn listen_tcp_happy() {
     let ticket = header.split_ascii_whitespace().last().unwrap();
     let ticket = EndpointTicket::from_str(ticket).unwrap();
     // poke the listen-tcp process with a connect command
-    let connect = duct::cmd(dumbpipe_bin(), ["connect", &ticket.to_string()])
+    let connect = duct::cmd(streampipe_bin(), ["connect", &ticket.to_string()])
         .env_remove("RUST_LOG") // disable tracing
         .stderr_null()
         .stdout_capture()
@@ -260,8 +260,8 @@ fn listen_tcp_happy() {
 fn connect_tcp_happy() {
     let port = random_port();
     let host_port = format!("localhost:{port}");
-    // start a dumbpipe listen process just so the connect-tcp command has something to connect to
-    let mut listen = duct::cmd(dumbpipe_bin(), ["listen"])
+    // start a streampipe listen process just so the connect-tcp command has something to connect to
+    let mut listen = duct::cmd(streampipe_bin(), ["listen"])
         .env_remove("RUST_LOG") // disable tracing
         .stdin_bytes(b"hello from listen\n")
         .stderr_to_stdout() //
@@ -273,9 +273,9 @@ fn connect_tcp_happy() {
     let ticket = EndpointTicket::from_str(ticket).unwrap();
     let ticket = ticket.to_string();
 
-    // start a dumbpipe connect-tcp process
+    // start a streampipe connect-tcp process
     let _connect_tcp = duct::cmd(
-        dumbpipe_bin(),
+        streampipe_bin(),
         ["connect-tcp", "--addr", &host_port, &ticket],
     )
     .env_remove("RUST_LOG") // disable tracing
@@ -360,7 +360,7 @@ fn udp_roundtrip() {
 
     // forward incoming datagrams to the echo server
     let mut listen_udp = duct::cmd(
-        dumbpipe_bin(),
+        streampipe_bin(),
         ["listen-udp", "--host", &echo_addr.to_string()],
     )
     .env_remove("RUST_LOG") // disable tracing
@@ -374,7 +374,7 @@ fn udp_roundtrip() {
 
     // expose a local udp port that feeds the tunnel
     let _connect_udp = duct::cmd(
-        dumbpipe_bin(),
+        streampipe_bin(),
         ["connect-udp", "--addr", &tunnel_addr.to_string(), &ticket],
     )
     .env_remove("RUST_LOG") // disable tracing
@@ -534,7 +534,7 @@ mod unix_socket_tests {
         }
 
         // Launch listen-unix targeting the backend.
-        let mut listen_proc = std::process::Command::new(dumbpipe_bin())
+        let mut listen_proc = std::process::Command::new(streampipe_bin())
             .args([
                 "listen-unix",
                 "--socket-path",
@@ -568,7 +568,7 @@ mod unix_socket_tests {
         });
 
         // Launch connect-unix, exposing the client socket.
-        let mut connect_proc = std::process::Command::new(dumbpipe_bin())
+        let mut connect_proc = std::process::Command::new(streampipe_bin())
             .args([
                 "connect-unix",
                 "--socket-path",
@@ -617,7 +617,7 @@ mod unix_socket_tests {
 ///
 /// Real media does not flow here, because that needs a publisher that completes
 /// ICE, DTLS and SRTP. The media path itself, including the keyframe gate, is
-/// covered by the unit tests in `dumbpipe::webrtc`.
+/// covered by the unit tests in `streampipe::webrtc`.
 #[cfg(test)]
 mod whip_tests {
     use std::{
@@ -822,11 +822,11 @@ mod whip_tests {
             .expect("a ticket")
     }
 
-    /// Start `dumbpipe listen-whip` on a random loopback port.
+    /// Start `streampipe listen-whip` on a random loopback port.
     fn listen(extra: &[&str]) -> (u16, Child, Arc<Mutex<String>>) {
         let port = random_port();
         let addr = format!("127.0.0.1:{port}");
-        let mut cmd = Command::new(dumbpipe_bin());
+        let mut cmd = Command::new(streampipe_bin());
         cmd.arg("listen-whip")
             .arg("--listen")
             .arg(&addr)
@@ -943,7 +943,7 @@ mod whip_tests {
             &request(
                 "PUT",
                 "/whip",
-                &headers("application/sdp", None, Some("\"dumbpipe-0\"")),
+                &headers("application/sdp", None, Some("\"streampipe-0\"")),
                 &offer,
             ),
         );
@@ -978,7 +978,7 @@ mod whip_tests {
         // an even port, because rtp uses the even port of a pair
         let play = random_port() & !1;
         let play_addr = format!("127.0.0.1:{play}");
-        let mut viewer = Command::new(dumbpipe_bin())
+        let mut viewer = Command::new(streampipe_bin())
             .args(["connect-whip", "-v", "--addr", &play_addr, "--no-launch"])
             .arg(&ticket)
             .env_remove("RUST_LOG")

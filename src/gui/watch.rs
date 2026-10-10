@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, str::FromStr};
 
-use dumbpipe::EndpointTicket;
+use streampipe::EndpointTicket;
 use eframe::egui::{self, Context, Ui};
 
 use super::{

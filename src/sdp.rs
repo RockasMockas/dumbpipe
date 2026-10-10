@@ -328,8 +328,8 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 pub fn render_player_sdp(header: &SessionHeader, video_port: u16, audio_port: u16) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "v=0");
-    let _ = writeln!(out, "o=dumbpipe {} 2 IN IP4 127.0.0.1", header.gen);
-    let _ = writeln!(out, "s=dumbpipe");
+    let _ = writeln!(out, "o=streampipe {} 2 IN IP4 127.0.0.1", header.gen);
+    let _ = writeln!(out, "s=streampipe");
     let _ = writeln!(out, "c=IN IP4 127.0.0.1");
     let _ = writeln!(out, "t=0 0");
     for m in &header.media {

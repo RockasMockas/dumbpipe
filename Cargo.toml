@@ -1,22 +1,19 @@
 [package]
-name = "dumbpipe"
-version = "0.39.0"
+name = "streampipe"
+version = "0.1.0"
 edition = "2021"
-authors = ["Rüdiger Klaehn <rklaehn@protonmail.com>", "n0 team"]
-keywords = ["netcat", "cli", "network", "p2p", "holepunching"]
+authors = ["https://github.com/RockasMockas/streampipe"]
+keywords = ["streaming", "video", "screenshare", "p2p", "obs"]
 categories = ["network-programming"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/dumbpipe"
-description = "A cli tool to pipe data over the network, with NAT hole punching"
+repository = "https://github.com/RockasMockas/streampipe"
+description = "Broadcast video/audio p2p to friends using streaming software like OBS"
 readme = "README.md"
-
-# Sadly this also needs to be updated in .github/workflows/ci.yml
 rust-version = "1.91"
-
 autobins = false
 
 [lib]
-name = "dumbpipe"
+name = "streampipe"
 path = "src/lib.rs"
 
 [[bin]]

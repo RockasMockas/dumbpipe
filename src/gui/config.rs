@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dumbpipe::webrtc::Player;
+use streampipe::webrtc::Player;
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 
@@ -136,7 +136,7 @@ impl Default for Config {
             default_player: player_key(Player::Mpv).to_string(),
             player_paths: PlayerPaths::default(),
             buffer_ms: None,
-            play_addr: dumbpipe::webrtc::DEFAULT_PLAY_ADDR.to_string(),
+            play_addr: streampipe::webrtc::DEFAULT_PLAY_ADDR.to_string(),
             broadcast_host: "127.0.0.1".to_string(),
             broadcast_port: 8080,
             bearer_token: None,
