@@ -247,12 +247,18 @@ impl App {
         ui.separator();
     }
 
-    /// The collapsible log panel along the bottom.
+    /// The log panel along the bottom.
+    ///
+    /// Fully collapsed (height 0) by default. Toggled by Ctrl/Cmd+L to occupy
+    /// half the window height.
     fn log_panel(&mut self, ui: &mut Ui) {
-        let resp = egui::Panel::bottom("log")
-            .resizable(true)
-            .default_size(160.0)
-            .show_collapsible(ui, &mut self.log_open, |ui| {
+        if !self.log_open {
+            return;
+        }
+        let half = ui.ctx().content_rect().height() * 0.5;
+        egui::Panel::bottom("log")
+            .exact_size(half)
+            .show(ui, |ui| {
                 let lines = log::snapshot(&self.log);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -267,9 +273,7 @@ impl App {
                     });
             });
         // Repaint while expanded so streaming logs appear without a storm.
-        if resp.is_some() {
-            ui.ctx().request_repaint_after(REPAINT);
-        }
+        ui.ctx().request_repaint_after(REPAINT);
     }
 
     /// The floating status pill ("Copied ✓", "Relay refreshed ✓", …), anchored
@@ -365,10 +369,20 @@ impl App {
 
         // Global keyboard shortcuts, consumed here so egui's default focus
         // traversal doesn't also fire on the same press. Ctrl/Cmd+, toggles the
-        // Settings overlay; while it's closed, Tab cycles the Watch/Broadcast tabs.
+        // Settings overlay; Ctrl/Cmd+L toggles the log panel between closed (height
+        // 0) and half the window; while Settings is closed, Tab cycles the
+        // Watch/Broadcast tabs.
         let ctx = ui.ctx();
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.show_options = !self.show_options;
+            ctx.request_repaint();
+        } else if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::L)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::L)
+        }) {
+            // Toggle the log panel between fully closed (height 0) and half the
+            // window height.
+            self.log_open = !self.log_open;
             ctx.request_repaint();
         } else if !self.show_options
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
