@@ -590,6 +590,14 @@ async fn bind_ice(configured: Option<SocketAddr>, listen: IpAddr) -> Result<UdpS
     let socket = UdpSocket::bind(bind)
         .await
         .std_context(format!("error binding ice udp socket to {bind}"))?;
+    // Maximize the kernel buffers so an instantaneous keyframe burst from the
+    // publisher (OBS emits a 6 Mbps IDR as 300+ KB at once) does not overrun
+    // the default SO_RCVBUF (~212 KB on Linux, 50 KB on macOS) and lose the
+    // tail of the keyframe before str0m ever sees it. `let _ =` swallows an
+    // error so a lower OS hard limit just clamps to the maximum allowed.
+    let sock = socket2::SockRef::from(&socket);
+    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
     Ok(socket)
 }
 
@@ -1505,6 +1513,10 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             .await
             .std_context("error binding the local forwarding socket")?,
     );
+    // A big send buffer absorbs the bursts the forward task cannot pace away,
+    // so a dense reorder flush does not spill onto the wire into ffplay's
+    // default-size receive buffer. `let _ =` clamps to the OS hard limit.
+    let _ = socket2::SockRef::from(&*video).set_send_buffer_size(8 * 1024 * 1024);
     let counters = Arc::new(Counters::default());
 
     let mut player: Option<PlayerHandle> = None;
@@ -1588,10 +1600,14 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
             // where FFmpeg ignores -buffer_size, so it is bounded by the OS default
             // SO_RCVBUF (~50-212 KB). When the reorder stage flushes a held burst it
             // can dump >100 KB at once and overrun that socket, dropping packets.
-            // Throttle bursts to ~16 KB/ms: zero latency in steady state, but a
-            // dense flush is spread over a few ms so the player can drain its buffer.
-            let mut burst_bytes = 0usize;
-            let mut burst_start = tokio::time::Instant::now();
+            // A token bucket caps a burst to 64 KB and refills at 16 KB/ms (16 MB/s,
+            // ~128 Mbps): zero latency in steady state (the bucket stays full far
+            // above the 6 Mbps stream), but a dense flush is spread over a few ms so
+            // the player can drain its buffer.
+            const BURST_CAP: usize = 64 * 1024;
+            const TOKEN_RATE: usize = 16 * 1024; // bytes per ms
+            let mut tokens = BURST_CAP;
+            let mut last_fill = tokio::time::Instant::now();
             while let Some(msg) = forward_rx.recv().await {
                 match msg {
                     ForwardMsg::Epoch => {
@@ -1601,7 +1617,20 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         last_kf = Some(Instant::now());
                     }
                     ForwardMsg::Packet(port, packet, is_video) => {
-                        let len = packet.len();
+                        let required = packet.len().min(BURST_CAP);
+                        loop {
+                            let now = tokio::time::Instant::now();
+                            let elapsed = now.duration_since(last_fill).as_millis() as usize;
+                            if elapsed > 0 {
+                                tokens = (tokens + elapsed * TOKEN_RATE).min(BURST_CAP);
+                                last_fill = now;
+                            }
+                            if tokens >= required {
+                                tokens -= required;
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                        }
                         forward(
                             &forward_video,
                             &packet,
@@ -1613,16 +1642,6 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                             &forward_kf_tx,
                         )
                         .await;
-                        burst_bytes += len;
-                        if burst_bytes > 16384 {
-                            let elapsed = burst_start.elapsed();
-                            let budget = Duration::from_millis(1);
-                            if elapsed < budget {
-                                tokio::time::sleep(budget - elapsed).await;
-                            }
-                            burst_bytes = 0;
-                            burst_start = tokio::time::Instant::now();
-                        }
                     }
                 }
             }

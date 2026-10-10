@@ -951,6 +951,7 @@ dependencies = [
  "nix",
  "noq",
  "rand 0.10.1",
+ "socket2",
  "str0m",
  "tempfile",
  "tokio",
