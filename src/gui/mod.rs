@@ -117,7 +117,7 @@ impl App {
         }
     }
 
-    /// The top menu bar with the status and the Options entry.
+    /// The bottom status bar with the Settings entry and the session status.
     fn menu_bar(&mut self, ui: &mut Ui) {
         let snap = state::snapshot(&self.state);
         // Computed before the closure: the closure mutably borrows `self` for the
@@ -152,9 +152,36 @@ impl App {
         });
     }
 
+    /// The app wordmark: a large, crisp, near-white title with a soft drop
+    /// shadow. The foreground is a single anti-aliased glyph (no faux-bold
+    /// offset copies, which render jaggy); weight comes from size and the
+    /// shadow gives it depth.
+    fn brand_title(&mut self, ui: &mut Ui) {
+        let text = "Streampipe";
+        let font_id = egui::FontId::proportional(30.0);
+        let fg = egui::Color32::from_rgb(242, 242, 246);
+
+        let fg_galley = ui.painter().layout_no_wrap(text.into(), font_id.clone(), fg);
+        // A soft shadow: the same glyph in dark, low-alpha layers at a few
+        // offsets, faking a blurred drop shadow behind the crisp text.
+        let shadow = egui::Color32::from_black_alpha(70);
+        let shadow_galley = ui.painter().layout_no_wrap(text.into(), font_id, shadow);
+
+        // Room for the glyph plus the shadow's furthest offset so it isn't clipped.
+        let size = fg_galley.size() + egui::vec2(3.0, 3.0);
+        let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let pos = rect.min;
+
+        let painter = ui.painter();
+        for off in [egui::vec2(1.0, 1.0), egui::vec2(2.0, 2.0), egui::vec2(3.0, 3.0)] {
+            painter.galley(pos + off, shadow_galley.clone(), egui::Color32::PLACEHOLDER);
+        }
+        painter.galley(pos, fg_galley, egui::Color32::PLACEHOLDER);
+    }
+
     /// The tab strip.
     fn tab_bar(&mut self, ui: &mut Ui) {
-        ui.heading("streampipe");
+        self.brand_title(ui);
         ui.add_space(6.0);
         // Two equal-width tabs that fill the whole strip; the selectable label is
         // sized to its half so the entire tab box (not just the text) is the click
@@ -359,7 +386,9 @@ impl App {
             ctx.request_repaint();
         }
 
-        egui::Panel::top("top").show(ui, |ui| {
+        // The status/settings bar lives at the very bottom edge. Registered
+        // before the `log` bottom panel, so the log stacks above it.
+        egui::Panel::bottom("menu_bar").show(ui, |ui| {
             self.menu_bar(ui);
         });
         if self.show_options {
