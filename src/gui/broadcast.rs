@@ -19,6 +19,14 @@ use super::{
 /// Horizontal room kept clear at the right edge of a copy box for the copy glyph,
 /// so a long value is elided before it reaches the mark.
 const GLYPH_GUTTER: f32 = 26.0;
+/// Height of the value line inside a copy box.
+const COPY_ROW_H: f32 = 22.0;
+/// Vertical inner margin of a copy box's frame; doubled, it pads the value line.
+const COPY_V_MARGIN: f32 = 6.0;
+/// Horizontal inner margin of a copy box's frame; the frame's outer width is the
+/// value line's `width` plus twice this, so callers must reserve it to avoid the
+/// box (and any trailing button) overflowing past the right edge.
+const COPY_H_MARGIN: f32 = 10.0;
 
 impl App {
     /// Render the Start Broadcasting tab.
@@ -31,160 +39,115 @@ impl App {
         // on the first focused frame (immutable read; the layout borrows follow).
         let window_focused = ui.input(|i| i.focused);
 
-        // Advanced settings: host, port and bearer token, prefilled. Collapsed by
-        // default so the common case is just the start button.
+        // Advanced settings: host, port, bearer token and optional fixed bind
+        // sockets, prefilled. Collapsed by default so the common case is just the
+        // start button. Each field is a full-width box with its label stacked above
+        // it, at a larger (1.3×) font, so the panel reads as one unified column.
         egui::CollapsingHeader::new("Advanced settings")
             .default_open(false)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!active, |ui| {
-                    egui::Grid::new("broadcast_advanced").show(ui, |ui| {
-                        ui.label("WHIP host");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.broadcast_host)
-                                .desired_width(180.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("WHIP port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.broadcast_port).range(1..=65535),
-                        );
-                        ui.end_row();
-
-                        ui.label("Bearer token");
-                        let mut token = self.config.bearer_token.clone().unwrap_or_default();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut token)
-                                .hint_text("none")
-                                .desired_width(180.0),
-                        );
-                        if resp.changed() {
-                            self.config.bearer_token = if token.trim().is_empty() {
-                                None
-                            } else {
-                                Some(token)
-                            };
+                    let big = ui.style().text_styles[&egui::TextStyle::Body].size * 1.3;
+                    let prop = egui::FontId::proportional(big);
+                    let box_h = big * 1.7;
+                    // Full-width editable field with its label on the line above.
+                    let field = |ui: &mut Ui,
+                                     label: &str,
+                                     hint: Option<&str>,
+                                     text: &mut String| {
+                        ui.label(egui::RichText::new(label).size(big));
+                        let mut te =
+                            egui::TextEdit::singleline(text).font(prop.clone());
+                        if let Some(h) = hint {
+                            te = te.hint_text(egui::RichText::new(h).size(big));
                         }
-                        ui.end_row();
+                        ui.add_sized([ui.available_width(), box_h], te);
+                    };
 
-                        // Optional fixed bind sockets. Empty (the default) binds an
-                        // ephemeral port and the ticket changes each session. A
-                        // streamer with a static public IP can pin `ip:port` here so
-                        // the ticket stays byte stable across sessions.
-                        ui.label("Bind IPv4:");
-                        let mut v4 = self
-                            .config
-                            .broadcast_bind_ipv4
-                            .clone()
-                            .unwrap_or_default();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut v4)
-                                .hint_text("e.g. 203.0.113.7:45678")
-                                .desired_width(180.0),
-                        );
-                        if resp.changed() {
-                            self.config.broadcast_bind_ipv4 = if v4.trim().is_empty() {
-                                None
-                            } else {
-                                Some(v4)
-                            };
-                        }
-                        ui.end_row();
+                    field(ui, "WHIP host", None, &mut self.config.broadcast_host);
 
-                        ui.label("Bind IPv6:");
-                        let mut v6 = self
-                            .config
-                            .broadcast_bind_ipv6
-                            .clone()
-                            .unwrap_or_default();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut v6)
-                                .hint_text("e.g. [2001:db8::1]:45678")
-                                .desired_width(180.0),
-                        );
-                        if resp.changed() {
-                            self.config.broadcast_bind_ipv6 = if v6.trim().is_empty() {
-                                None
-                            } else {
-                                Some(v6)
-                            };
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("WHIP port").size(big));
+                    let mut port = self.config.broadcast_port.to_string();
+                    let resp = ui.add_sized(
+                        [ui.available_width(), box_h],
+                        egui::TextEdit::singleline(&mut port).font(prop.clone()),
+                    );
+                    if resp.changed() {
+                        if let Ok(p) = port.trim().parse::<u16>() {
+                            if p >= 1 {
+                                self.config.broadcast_port = p;
+                            }
                         }
-                        ui.end_row();
-                    });
+                    }
+
+                    ui.add_space(8.0);
+                    let mut token = self.config.bearer_token.clone().unwrap_or_default();
+                    field(ui, "Bearer token", Some("none"), &mut token);
+                    if token != self.config.bearer_token.clone().unwrap_or_default() {
+                        self.config.bearer_token = if token.trim().is_empty() {
+                            None
+                        } else {
+                            Some(token)
+                        };
+                    }
+
+                    // Optional fixed bind sockets. Empty (the default) binds an
+                    // ephemeral port and the ticket changes each session. A
+                    // streamer with a static public IP can pin `ip:port` here so
+                    // the ticket stays byte stable across sessions.
+                    ui.add_space(8.0);
+                    let mut v4 = self
+                        .config
+                        .broadcast_bind_ipv4
+                        .clone()
+                        .unwrap_or_default();
+                    field(
+                        ui,
+                        "Bind IPv4:",
+                        Some("e.g. 203.0.113.7:45678"),
+                        &mut v4,
+                    );
+                    self.config.broadcast_bind_ipv4 = if v4.trim().is_empty() {
+                        None
+                    } else {
+                        Some(v4)
+                    };
+
+                    ui.add_space(8.0);
+                    let mut v6 = self
+                        .config
+                        .broadcast_bind_ipv6
+                        .clone()
+                        .unwrap_or_default();
+                    field(
+                        ui,
+                        "Bind IPv6:",
+                        Some("e.g. [2001:db8::1]:45678"),
+                        &mut v6,
+                    );
+                    self.config.broadcast_bind_ipv6 = if v6.trim().is_empty() {
+                        None
+                    } else {
+                        Some(v6)
+                    };
                 });
             });
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if broadcasting || starting {
-                if ui
-                    .add(
-                        egui::Button::new("■  Stop Broadcasting").min_size(egui::vec2(180.0, 30.0)),
-                    )
-                    .clicked()
-                {
-                    state::stop(&self.state, ui.ctx());
-                    self.config.save();
-                }
-                // Once OBS is in, swap the "waiting" hint for a live viewer count
-                // in the accent colour, so a healthy stream reads at a glance.
-                let viewers = snap.stats.map(|s| s.viewers).unwrap_or(0);
-                if starting {
-                    ui.label("starting…");
-                } else if viewers > 0 {
-                    ui.colored_label(
-                        ACCENT,
-                        format!(
-                            "{viewers} viewer{} live",
-                            if viewers == 1 { "" } else { "s" }
-                        ),
-                    );
-                } else {
-                    ui.label("waiting for OBS to connect");
-                }
-            } else {
-                let button = egui::Button::new("●  Start Broadcasting")
-                    .min_size(egui::vec2(180.0, 30.0))
-                    .fill(ACCENT.gamma_multiply(0.18))
-                    .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
-                // Autofocus the start control on the first window-focused idle frame so
-                // Enter/Space starts it; the Stop button (shown while active) is never
-                // autofocused, so a stray Enter can never tear down a live stream. The
-                // button's auto id is stable across frames, so focus requested off
-                // `resp` sticks to it without needing an explicit id.
-                let resp = ui.add_enabled(!active, button);
-                if self.focus_primary && window_focused {
-                    if !active {
-                        resp.request_focus();
-                    }
-                    self.focus_primary = false;
-                }
-                // Mouse click and keyboard (Space/Enter on the focused button) both
-                // arrive via `clicked()` — a single trigger, no parallel Enter gate.
-                if resp.clicked() {
-                    self.start_broadcast(ui.ctx());
-                }
-            }
-        });
-
-        if let Some(err) = &snap.error {
-            ui.add_space(6.0);
-            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
-        }
 
         // Once live, reveal the two click-to-copy boxes and the statistics. While
         // idle, still surface the saved ticket so it can be copied and refreshed for
         // the next broadcast — but never offer a refresh live, since rebinding the
-        // endpoint mid-stream would tear down the running session.
+        // endpoint mid-stream would tear down the running session. These sit above
+        // the primary action, which is pinned to the bottom of the tab.
         if broadcasting {
             ui.add_space(12.0);
             ui.strong("Give OBS this WHIP server URL:");
-            let w = ui.available_width();
+            let w = (ui.available_width() - COPY_H_MARGIN * 2.0).max(0.0);
             self.copy_box(ui, "whip", &snap.whip_url, w);
             ui.add_space(6.0);
             ui.strong("Send friends this ticket to watch:");
             let ticket = snap.ticket.clone().unwrap_or_else(|| "…".into());
-            let w = ui.available_width();
+            let w = (ui.available_width() - COPY_H_MARGIN * 2.0).max(0.0);
             self.copy_box(ui, "ticket", &ticket, w);
 
             // Remember the ticket we are actually showing, so the most recent
@@ -219,6 +182,63 @@ impl App {
                 self.refresh_relay(ui.ctx());
             }
         }
+
+        if let Some(err) = &snap.error {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+        }
+
+        // The primary action is pinned to the bottom of the tab, full width, so it
+        // reads as the one big commitment after the (optional) settings and the
+        // shareable ticket/stats above it.
+        ui.add_space(12.0);
+        let bw = ui.available_width();
+        if broadcasting || starting {
+            // Once OBS is in, swap the "waiting" hint for a live viewer count in the
+            // accent colour, so a healthy stream reads at a glance.
+            let viewers = snap.stats.map(|s| s.viewers).unwrap_or(0);
+            if starting {
+                ui.label("starting…");
+            } else if viewers > 0 {
+                ui.colored_label(
+                    ACCENT,
+                    format!(
+                        "{viewers} viewer{} live",
+                        if viewers == 1 { "" } else { "s" }
+                    ),
+                );
+            } else {
+                ui.label("waiting for OBS to connect");
+            }
+            if ui
+                .add_sized([bw, 36.0], egui::Button::new("■  Stop Broadcasting"))
+                .clicked()
+            {
+                state::stop(&self.state, ui.ctx());
+                self.config.save();
+            }
+        } else {
+            let button = egui::Button::new("●  Start Broadcasting")
+                .fill(ACCENT.gamma_multiply(0.18))
+                .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)));
+            // Autofocus the start control on the first window-focused idle frame so
+            // Enter/Space starts it; the Stop button (shown while active) is never
+            // autofocused, so a stray Enter can never tear down a live stream. The
+            // button's auto id is stable across frames, so focus requested off
+            // `resp` sticks to it without needing an explicit id.
+            let resp = ui.add_sized([bw, 36.0], button);
+            if self.focus_primary && window_focused {
+                if !active {
+                    resp.request_focus();
+                }
+                self.focus_primary = false;
+            }
+            // Mouse click and keyboard (Space/Enter on the focused button) both
+            // arrive via `clicked()` — a single trigger, no parallel Enter gate.
+            if resp.clicked() {
+                self.start_broadcast(ui.ctx());
+            }
+        }
     }
 
     /// A ticket copy box with an optional trailing button on its right edge.
@@ -238,22 +258,38 @@ impl App {
         busy_label: &str,
     ) -> bool {
         if !allow {
-            let w = ui.available_width();
+            let w = (ui.available_width() - COPY_H_MARGIN * 2.0).max(0.0);
             self.copy_box(ui, key, text, w);
             return false;
         }
         let refreshing = self.state.lock().unwrap().refreshing;
         ui.horizontal(|ui| {
-            // Reserve room for the button so the box neither overflows the row nor
-            // pushes the button onto the next line.
-            let reserve = 110.0;
-            let w = (ui.available_width() - reserve - ui.spacing().item_spacing.x).max(0.0);
+            // Reserve room for the button (and the box frame's horizontal margins) so
+            // the box neither overflows the row nor pushes the button offscreen.
+            let reserve = 120.0;
+            let w = (ui.available_width()
+                - reserve
+                - ui.spacing().item_spacing.x
+                - COPY_H_MARGIN * 2.0)
+                .max(0.0);
             self.copy_box(ui, key, text, w);
+            // Match the box's rendered height so the button sits flush with it, and
+            // tint it with the same accent so the pair reads as one control group.
+            let h = self.copy_box_height();
             let label = if refreshing { busy_label } else { label };
-            ui.add_enabled(!refreshing, egui::Button::new(label))
-                .clicked()
+            let btn = egui::Button::new(label)
+                .min_size(egui::vec2(reserve, h))
+                .fill(ACCENT.gamma_multiply(0.10))
+                .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.5)));
+            ui.add_enabled(!refreshing, btn).clicked()
         })
         .inner
+    }
+
+    /// The rendered height of a [`App::copy_box`] row (text line plus the frame's
+    /// vertical inner margins), used to size a trailing button to sit flush with it.
+    fn copy_box_height(&self) -> f32 {
+        COPY_ROW_H + COPY_V_MARGIN * 2.0
     }
 
     /// Rebind the endpoint (same identity) and mint a fresh saved ticket, picking up a
@@ -329,7 +365,10 @@ impl App {
             .fill(egui::Color32::from_rgba_unmultiplied(
                 80, 200, 120, fill_alpha,
             ))
-            .inner_margin(egui::Margin::symmetric(10, 6));
+            .inner_margin(egui::Margin::symmetric(
+                COPY_H_MARGIN as i8,
+                COPY_V_MARGIN as i8,
+            ));
         let inner = frame.show(ui, |ui| {
             // Reserve a gutter on the right for the copy glyph so a long ticket
             // neither runs under the mark nor off the box. The full string is still
@@ -344,7 +383,7 @@ impl App {
             // Lay the value out ourselves at the row's left edge rather than via
             // `add_sized`, which was offsetting the galley toward the centre and
             // spilling long values past the box.
-            let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, 22.0));
+            let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, COPY_ROW_H));
             ui.allocate_rect(row, egui::Sense::hover());
             let y = row.center().y - galley.rect.height() * 0.5;
             ui.painter().galley(egui::pos2(row.min.x, y), galley, color);
