@@ -1680,19 +1680,23 @@ pub async fn connect_whip(endpoint: Endpoint, cfg: ViewerConfig) -> Result<()> {
                         }
                         Some(TAG_EPOCH) => {
                             if header.as_ref().is_some_and(|h| h.has_media()) {
-                                forwarding = true;
+                                if !forwarding {
+                                    forwarding = true;
+                                    // Only wipe the buffers when opening the gate.
+                                    // Mid-stream epochs would delete valid fragments
+                                    // and reordered packets of the new keyframe,
+                                    // since QUIC datagrams are unordered.
+                                    reassembler.clear();
+                                    video_order.clear();
+                                    audio_order.clear();
+                                    tracing::info!("streaming from a keyframe");
+                                }
                                 // Tell the forward task to reset its gap baseline:
                                 // a gap right after this keyframe is not a loss and
                                 // must not poke the encoder.
                                 if forward_tx.try_send(ForwardMsg::Epoch).is_err() {
                                     counters.undeliverable.fetch_add(1, Ordering::Relaxed);
                                 }
-                                // fragments and out-of-order packets of the old GOP
-                                // are dead now; reset the sequence baseline too
-                                reassembler.clear();
-                                video_order.clear();
-                                audio_order.clear();
-                                tracing::info!("streaming from a keyframe");
                             }
                         }
                         Some(tag @ (TAG_VIDEO | TAG_AUDIO)) if forwarding => {
